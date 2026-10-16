@@ -1,0 +1,149 @@
+name: Bug report
+description: Something is broken — wrong results, an error, a failed install, or Hermes won't load the plugin.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please check these first:
+
+        - [ ] I searched [existing issues](https://github.com/JasonSwindle/hermes-deepseek-search-fetch/issues) for a duplicate
+        - [ ] I restarted the session — routing changes only take effect on the **next** session
+        - [ ] I redacted my API key. **Never paste it** — write `***` instead
+
+        Security problems do **not** belong here; see the security policy link on the new-issue page.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What's broken
+      description: A clear description, including any error text or unexpected result.
+      placeholder: |
+        What happened, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that shows the problem.
+      placeholder: |
+        1. Enable the plugin and pin both routes
+        2. Ask the agent to extract https://example.com
+        3. Tool returns ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Include the full tool result or error if you have it.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      multiple: true
+      options:
+        - Search (web_search results)
+        - Extract (web_extract content)
+        - Plugin loading (enable, validate, doctor)
+        - Routing (the wrong provider is used)
+        - Configuration (web.* keys, DEEPSEEK_BASE_URL)
+        - Install from the plugin catalog
+        - Docs (README, AGENTS.md)
+        - Tests or CI
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: routing
+    attributes:
+      label: How are your web routes configured?
+      description: Output of `hermes config get web` if you're unsure.
+      options:
+        - deepseek for both search and extract
+        - deepseek for one of them only
+        - Another provider is pinned for one or both
+        - Nothing pinned (Hermes picks)
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: hermes-version
+    attributes:
+      label: Hermes version
+      description: Output of `hermes version`
+      placeholder: "0.22.0"
+    validations:
+      required: true
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version
+      description: The `version:` line in the installed `plugin.yaml`
+      placeholder: "1.0.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Ubuntu 24.04 / macOS 15.2 / Windows 11
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      description: Output of `python --version`
+      placeholder: "3.14.7"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: |
+        Hermes logs provider provenance, which is the fastest way to see what happened.
+        Look for lines like `Web extract via deepseek: 1 URL(s)` or a rescue notice
+        (`web_search backend 'deepseek' failed ... one-shot keyless rescue`).
+        Redact your key if it appears.
+      render: shell
+      placeholder: "2026-10-16 16:17:44,780 INFO tools.web_tools: Web extract via deepseek: 1 URL(s)"
+
+  - type: textarea
+    id: validation-output
+    attributes:
+      label: Validation output (optional)
+      description: |
+        If the problem is with loading or installing, paste the output of:
+        `hermes plugins validate` and `hermes plugins doctor` (see the Diagnostics section in the README).
+      render: shell
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: I am reporting a bug, not a security vulnerability
+          required: true
+        - label: I have not included my API key or any other secret in this report
+          required: true
+        - label: The test suite passes on my machine (`python -m unittest discover -s tests`)

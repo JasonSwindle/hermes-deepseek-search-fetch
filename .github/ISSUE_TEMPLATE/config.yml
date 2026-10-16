@@ -1,0 +1,16 @@
+# Issue chooser configuration.
+# Blank issues are off so every report arrives with the fields needed to act on it.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/JasonSwindle/hermes-deepseek-search-fetch/security/advisories/new
+    about: Report privately. Please do not open a public issue for a security problem.
+
+  - name: Bug or request in Hermes itself
+    url: https://github.com/NousResearch/hermes-agent/issues
+    about: This repository is only the DeepSeek web provider plugin — host-app bugs go upstream.
+
+  - name: Question or usage help
+    url: https://github.com/JasonSwindle/hermes-deepseek-search-fetch/blob/main/README.md
+    about: The README covers install, routing, cost, limits, security and the test commands.
