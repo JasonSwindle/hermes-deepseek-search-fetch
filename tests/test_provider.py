@@ -112,6 +112,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(500, {"error": {"message": "boom"}})
         if prefix.startswith("/html"):
             return self._send_raw(200, b"<html>not json</html>")
+        if prefix.startswith("/body_content"):
+            return self._send(200, {"results": [
+                {"title": "Doc", "url": "https://example.invalid/doc1",
+                 "summary": "Doc one summary", "content": "# Doc one"},
+                {"title": "Empty", "url": "https://example.invalid/doc2",
+                 "summary": "Doc two summary", "content": ""},
+            ]})
         if prefix.startswith("/shape_null"):
             return self._send(200, {"results": None})
         if prefix.startswith("/shape_str"):
@@ -271,6 +278,39 @@ class TestSearchContract(MockVendor):
             "description": "Mock Summary", "position": 1})
         self.assertEqual(out["data"]["web"][1]["description"], "Only Snippet")
         self.assertEqual(out["data"]["web"][1]["position"], 2)
+
+    def test_need_content_is_off_by_default(self):
+        """The default stays metadata-only: no flag on the wire, no content key."""
+        os.environ.pop("DEEPSEEK_SEARCH_NEED_CONTENT", None)
+        p = provider("s_nc_default", f"{self.base}/body_content")
+        out = p.search("q", limit=2)
+        self.assertEqual(self.last_body(), {"query": "q", "count": 2})
+        for hit in out["data"]["web"]:
+            self.assertNotIn("content", hit)
+
+    def test_need_content_opt_in_sends_the_flag_and_maps_content(self):
+        os.environ["DEEPSEEK_SEARCH_NEED_CONTENT"] = "1"
+        try:
+            p = provider("s_nc_on", f"{self.base}/body_content")
+            out = p.search("q", limit=2)
+            self.assertEqual(self.last_body(),
+                             {"query": "q", "count": 2, "need_content": True})
+            self.assertEqual([h["content"] for h in out["data"]["web"]],
+                             ["# Doc one", ""])
+        finally:
+            os.environ.pop("DEEPSEEK_SEARCH_NEED_CONTENT", None)
+
+    def test_need_content_flag_spellings(self):
+        mod = load_plugin("s_nc_flag", None)
+        for value in ("1", "true", "TRUE", "Yes", "on", " on "):
+            with self.subTest(value=value):
+                os.environ["DEEPSEEK_SEARCH_NEED_CONTENT"] = value
+                self.assertTrue(mod._need_content_enabled())
+        for value in ("", "0", "no", "off", "false", "nope"):
+            with self.subTest(value=value):
+                os.environ["DEEPSEEK_SEARCH_NEED_CONTENT"] = value
+                self.assertFalse(mod._need_content_enabled())
+        os.environ.pop("DEEPSEEK_SEARCH_NEED_CONTENT", None)
 
     def test_query_is_utf8_sanitised_before_send(self):
         p = provider("s_sur", f"{self.base}/ok")

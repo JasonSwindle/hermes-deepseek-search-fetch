@@ -82,6 +82,28 @@ def _unescape_markdown(text: str) -> str:
     return _UNESCAPE_RE.sub(r"\1", text)
 
 
+# Search returns metadata only unless the API is asked for page content. Setting
+# `need_content` makes every result carry its page text as clean Markdown — and
+# costs 2-5 KB per result, straight into the tool result and the context window.
+# So it is opt-in: DEEPSEEK_SEARCH_NEED_CONTENT=1 (or true/yes/on).
+_NEED_CONTENT_ENV = "DEEPSEEK_SEARCH_NEED_CONTENT"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _need_content_enabled() -> bool:
+    """True when the operator opted into page content on search results.
+
+    Read through get_provider_env so a value set in Hermes' config layer works
+    like one exported in the environment. Any failure to read the flag counts as
+    "off" — a capability must never fail over a preference.
+    """
+    try:
+        raw = get_provider_env(_NEED_CONTENT_ENV) or ""
+    except Exception:  # never raise out of a capability
+        return False
+    return raw.strip().lower() in _TRUTHY
+
+
 def _missing_key_error() -> str:
     return (
         "DEEPSEEK_API_KEY is not set. Add it for the deepseek-search-fetch plugin "
@@ -134,17 +156,25 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
         try:
             query = _utf8_safe(query) if isinstance(query, str) else query
             count = min(max(int(limit), 1), _SEARCH_LIMIT_CAP)
-            data = self._post(_SEARCH_URL, {"query": query, "count": count})
+            want_content = _need_content_enabled()
+            payload: dict[str, Any] = {"query": query, "count": count}
+            if want_content:
+                payload["need_content"] = True
+            data = self._post(_SEARCH_URL, payload)
             rows = data.get("results") or []
-            hits = [
-                {
+            hits: list[dict[str, Any]] = []
+            for i, r in enumerate(rows):
+                hit: dict[str, Any] = {
                     "title": r.get("title") or "",
                     "url": r.get("url") or "",
                     "description": r.get("summary") or r.get("snippet") or "",
                     "position": i + 1,
                 }
-                for i, r in enumerate(rows)
-            ]
+                if want_content:
+                    # The search endpoint returns page text as clean Markdown —
+                    # no backslash escaping, unlike the fetch endpoint.
+                    hit["content"] = r.get("content") or ""
+                hits.append(hit)
             return {"success": True, "data": {"web": hits}}
         except Exception as exc:  # never raise out of a capability
             logger.warning("DeepSeek search failed: %s", exc)

@@ -84,7 +84,7 @@ hermes plugins disable deepseek-search-fetch
 ## How it works
 
 - Hermes resolves the provider from `web.search_backend` / `web.extract_backend` (falling back to `web.backend`, then its own preference walks). This plugin registers the name `deepseek`.
-- `search()` posts `{query, count}` and maps `results[]` into Hermes' hit shape, preferring each result's `summary` and falling back to `snippet`.
+- `search()` posts `{query, count}` — plus `need_content: true` when `DEEPSEEK_SEARCH_NEED_CONTENT` is set — and maps `results[]` into Hermes' hit shape, preferring each result's `summary` and falling back to `snippet`. With the opt-in on, each hit also carries the page's `content` as clean Markdown.
 - `extract()` posts `{url}` **one URL per call** (the endpoint is single-URL), so multi-URL extracts run sequentially and preserve input order. Each entry carries `title`, `content`, `raw_content` and `metadata.sourceURL`, with **both** content fields holding the unescaped Markdown (see below).
 - Failures never raise: a bad call returns an error envelope (or a per-entry `error`), which is exactly what lets Hermes' rescue logic see it and fall over to the free ring.
 - `is_available()` is an environment check only — Hermes calls it on every `hermes tools` paint, so it must never touch the network.
@@ -100,6 +100,7 @@ hermes plugins disable deepseek-search-fetch
 - Unpaired surrogate code points in a query or URL are replaced with U+FFFD first: `httpx` raises while *encoding* the body otherwise, so the call would die before leaving the process.
 - **Fetched Markdown arrives backslash-escaped, and this plugin reverses it.** `/v1/tools/fetch` escapes every ASCII punctuation character in the page text — a page's `# Heading` comes back as `\# Heading`, links as `\[text\]\(https\:\/\/…\)`, table pipes as `\|` — so the text renders as punctuation rather than structure. `extract()` unescapes backslash-plus-punctuation in **both** `content` and `raw_content`. Both, not one: Hermes prefers `raw_content` when it derives the model-visible content and when it writes its extract cache, so a half-fix would keep serving escaped text out of the cache. Letter escapes survive untouched (`\n`, `\d+`, `C:\path`), and a page whose own source deliberately escaped punctuation will have that escape removed too — the vendor's escaping is uniform, so no rule can tell the two apart.
 - Empty search results are success with an empty list, not an error.
+- **Search returns metadata only unless you ask for content.** `need_content` is a per-request option on the Search API, and this plugin sends it only when `DEEPSEEK_SEARCH_NEED_CONTENT` is truthy — one search then carries the pages' text, where getting the same text otherwise costs one Fetch call per URL. It is off by default because that text is 2–5 KB per result, and Hermes' own `web_search` contract is metadata-only ("use `web_extract` for page content"). When it is on, the search endpoint's `content` needs no unescaping — that escaping is a fetch-endpoint behaviour.
 - `extract()` returns a **bare list** of entries. Parts of the Hermes docs show a `{"success": …, "data": […]}` envelope instead; the bundled providers return a bare list and the dispatcher consumes it that way, so this matches bundled behaviour deliberately — pinned by a test.
 - A rescued **search** carries `rescued_from` / `backend_error`; a rescued **extract** does not, because Hermes drops entry metadata during serialization. Judge extract provenance from the log line (`Web extract via …`).
 
@@ -141,6 +142,7 @@ See [Tests](#tests) — they need no key, no network and no Hermes install.
 | What | Where | Notes |
 |---|---|---|
 | Endpoint | `DEEPSEEK_BASE_URL` | Tests only; validated as described above. |
+| Page content on search results | `DEEPSEEK_SEARCH_NEED_CONTENT` | Off by default. Set to `1` (or `true`/`yes`/`on`) to send `need_content: true` — every hit then carries its page text as clean Markdown. Costs 2–5 KB per result in the tool result and the context window. |
 | Result cap | `_SEARCH_LIMIT_CAP` in `__init__.py` | `50` — DeepSeek's own maximum. |
 | Timeout | `_TIMEOUT` in `__init__.py` | `30.0` s per HTTP call. |
 | Provider name | `provides_web_providers` in `plugin.yaml` | `deepseek`; changing it changes what your config must say. |
