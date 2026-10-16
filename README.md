@@ -6,7 +6,7 @@
 
 Routes [Hermes Agent](https://hermes-agent.nousresearch.com/docs)'s `web_search` and `web_extract` tools through DeepSeek's [Search & Fetch APIs](https://api-docs.deepseek.com/guides/search/). One file, no dependencies, and the invariants that would otherwise fail silently are pinned by the tests in `tests/`.
 
-- **Search** — `POST /v1/tools/search` → ranked hits with `title`, `url`, `description`, `position`
+- **Search** — `POST /v1/tools/search` → ranked hits with `title`, `url`, `description`, `position`, plus the vendor's quality and freshness signals: `rerank_score` (0–3; ≥1.5 is high quality), `authority` (0–4; `-1` unknown, ≥3 authoritative) and `date` (RFC 3339 UTC, or `null`)
 - **Fetch** — `POST /v1/tools/fetch` → Markdown per URL as `title` + `content`, with the vendor's punctuation escaping reversed so headings, links and tables arrive as Markdown instead of literal `\#` / `\[`
 - **Your key, your account** — calls go to `api.deepseek.com` and nowhere else; nothing is proxied, nothing phones home
 
@@ -84,7 +84,7 @@ hermes plugins disable deepseek-search-fetch
 ## How it works
 
 - Hermes resolves the provider from `web.search_backend` / `web.extract_backend` (falling back to `web.backend`, then its own preference walks). This plugin registers the name `deepseek`.
-- `search()` posts `{query, count}` — plus `need_content: true` when `DEEPSEEK_SEARCH_NEED_CONTENT` is set — and maps `results[]` into Hermes' hit shape, preferring each result's `summary` and falling back to `snippet`. With the opt-in on, each hit also carries the page's `content` as clean Markdown.
+- `search()` posts `{query, count}` — plus `need_content: true` when `DEEPSEEK_SEARCH_NEED_CONTENT` is set — and maps `results[]` into Hermes' hit shape, preferring each result's `summary` and falling back to `snippet`. Every hit also carries the vendor's `rerank_score`, `authority` and `date` (`None` when the vendor omits them), so a result set can be filtered before anything is fetched. With the opt-in on, each hit carries the page's `content` as clean Markdown too.
 - `extract()` posts `{url}` **one URL per call** (the endpoint is single-URL), so multi-URL extracts run sequentially and preserve input order. Each entry carries `title`, `content`, `raw_content` and `metadata.sourceURL`, with **both** content fields holding the unescaped Markdown (see below).
 - Failures never raise: a bad call returns an error envelope (or a per-entry `error`), which is exactly what lets Hermes' rescue logic see it and fall over to the free ring.
 - `is_available()` is an environment check only — Hermes calls it on every `hermes tools` paint, so it must never touch the network.

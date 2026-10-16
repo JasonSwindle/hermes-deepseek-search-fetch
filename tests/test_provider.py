@@ -119,6 +119,12 @@ class Handler(BaseHTTPRequestHandler):
                 {"title": "Empty", "url": "https://example.invalid/doc2",
                  "summary": "Doc two summary", "content": ""},
             ]})
+        if prefix.startswith("/body_meta"):
+            return self._send(200, {"results": [
+                {"title": "Ranked", "url": "https://example.invalid/r1", "summary": "S1",
+                 "rerank_score": 2.4, "authority": 3, "date": "2026-06-01T00:00:00+00:00"},
+                {"title": "Thin", "url": "https://example.invalid/r2", "snippet": "S2"},
+            ]})
         if prefix.startswith("/shape_null"):
             return self._send(200, {"results": None})
         if prefix.startswith("/shape_str"):
@@ -275,9 +281,23 @@ class TestSearchContract(MockVendor):
         self.assertTrue(out["success"])
         self.assertEqual(out["data"]["web"][0], {
             "title": "Mock Title", "url": "https://example.invalid/1",
-            "description": "Mock Summary", "position": 1})
+            "description": "Mock Summary", "position": 1,
+            "rerank_score": None, "authority": None, "date": None})
         self.assertEqual(out["data"]["web"][1]["description"], "Only Snippet")
         self.assertEqual(out["data"]["web"][1]["position"], 2)
+
+    def test_quality_and_freshness_fields_are_mapped(self):
+        """A caller can filter on these without paying to fetch the page."""
+        out = provider("s_meta", f"{self.base}/body_meta").search("q", limit=2)
+        first, second = out["data"]["web"]
+        self.assertEqual(first["rerank_score"], 2.4)
+        self.assertEqual(first["authority"], 3)
+        self.assertEqual(first["date"], "2026-06-01T00:00:00+00:00")
+        self.assertEqual(second["title"], "Thin")
+        for field in ("rerank_score", "authority", "date"):
+            with self.subTest(field=field):
+                self.assertIn(field, second)
+                self.assertIsNone(second[field])
 
     def test_need_content_is_off_by_default(self):
         """The default stays metadata-only: no flag on the wire, no content key."""
@@ -444,8 +464,10 @@ class TestProviderContract(MockVendor):
         out = provider("contract_env", f"{self.base}/ok").search("q", limit=2)
         self.assertEqual(set(out), {"success", "data"})
         self.assertEqual(set(out["data"]), {"web"})
+        expected = {"title", "url", "description", "position",
+                    "rerank_score", "authority", "date"}
         for hit in out["data"]["web"]:
-            self.assertEqual(set(hit), {"title", "url", "description", "position"})
+            self.assertEqual(set(hit), expected)
 
     def test_extract_returns_a_bare_list_not_an_envelope(self):
         """Deliberate divergence, pinned so a future change is a conscious one: the

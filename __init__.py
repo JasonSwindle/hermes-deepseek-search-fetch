@@ -169,6 +169,12 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
                     "url": r.get("url") or "",
                     "description": r.get("summary") or r.get("snippet") or "",
                     "position": i + 1,
+                    # Quality and freshness signals, so a caller can filter a
+                    # result set without paying to fetch it. None when the
+                    # vendor omits them — the keys are always present.
+                    "rerank_score": r.get("rerank_score"),
+                    "authority": r.get("authority"),
+                    "date": r.get("date"),
                 }
                 if want_content:
                     # The search endpoint returns page text as clean Markdown —

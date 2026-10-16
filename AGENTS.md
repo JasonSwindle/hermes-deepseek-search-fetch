@@ -28,10 +28,11 @@ against a broken copy proves nothing. Same for the unescaper: neuter
 
 ## Invariants — these are pinned by tests
 
-- `search()` returns `{"success": bool, "data": {"web": [{title, url, description, position}]}}`,
-  and posts `need_content: true` only when `DEEPSEEK_SEARCH_NEED_CONTENT` is truthy (the default
-  stays metadata-only, matching Hermes' `web_search` contract). With the opt-in on, each hit also
-  carries `content` — the page text, which the search endpoint returns as clean Markdown.
+- `search()` returns `{"success": bool, "data": {"web": [{title, url, description, position,
+  rerank_score, authority, date}]}}`, and posts `need_content: true` only when
+  `DEEPSEEK_SEARCH_NEED_CONTENT` is truthy (the default stays metadata-only, matching Hermes'
+  `web_search` contract). With the opt-in on, each hit also carries `content` — the page text,
+  which the search endpoint returns as clean Markdown.
 - `extract()` returns a **bare list** of entry dicts (`url`, `title`, `content`,
   `raw_content`, `metadata`, or `error` per entry) — *not* the
   `{"success": …, "data": […]}` envelope the Hermes docs show elsewhere. The bundled

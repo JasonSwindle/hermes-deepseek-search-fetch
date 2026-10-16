@@ -125,6 +125,10 @@ if HAVE_HYPOTHESIS:
     UTF8_TEXT = st.text(alphabet=st.characters(codec="utf-8"))
     FAST = settings(deadline=None, max_examples=200)
     HTTP_OK = settings(deadline=None, max_examples=25, suppress_health_check=[HealthCheck.too_slow])
+    # ASCII punctuation is exactly what the fetch endpoint backslashes. Text with
+    # no backslash of its own is where escaping and unescaping are invertible.
+    PUNCT = {c for c in map(chr, range(0x21, 0x7F)) if not c.isalnum()}
+    ESCAPABLE_TEXT = st.text(alphabet=st.characters(codec="utf-8", exclude_characters="\\\\"))
 
     class TestUnicodeInvariants(unittest.TestCase):
         """The invariants the chaos pass had to discover by hand."""
@@ -160,6 +164,24 @@ if HAVE_HYPOTHESIS:
         @settings(FAST)
         def test_valid_text_is_untouched(self, text):
             self.assertEqual(pure_module()._utf8_safe(text), text)
+
+        @given(ANY_TEXT)
+        @settings(FAST)
+        def test_unescape_is_total_and_non_growing(self, text):
+            """Never raises and never grows the text. Deliberately not a
+            sanitiser: surrogate repair belongs to `_utf8_safe`, on the way out
+            to the wire — a fetched payload may legitimately contain a lone
+            surrogate and unescaping must not be asked to fix it."""
+            self.assertLessEqual(len(pure_module()._unescape_markdown(text)), len(text))
+
+        @given(ESCAPABLE_TEXT)
+        @settings(FAST)
+        def test_unescape_inverts_the_vendors_punctuation_escaping(self, text):
+            """The endpoint backslashes every punctuation character, so the
+            unescaping is its exact inverse — checked for text with no backslash
+            of its own, which is where the two are distinguishable at all."""
+            escaped = "".join("\\" + c if c in PUNCT else c for c in text)
+            self.assertEqual(pure_module()._unescape_markdown(escaped), text)
 
         # -- wire -------------------------------------------------------------
         @given(ANY_TEXT)
