@@ -1,6 +1,8 @@
 # 🔍 deepseek-search-fetch — DeepSeek Search & Fetch as a Hermes web provider
 
 [![tests](https://github.com/JasonSwindle/hermes-deepseek-search-fetch/actions/workflows/tests.yml/badge.svg)](https://github.com/JasonSwindle/hermes-deepseek-search-fetch/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Hermes Agent plugin](https://img.shields.io/badge/Hermes-Agent%20plugin-8A63D2.svg)](https://github.com/NousResearch/hermes-agent)
 
 Routes [Hermes Agent](https://hermes-agent.nousresearch.com/docs)'s `web_search` and `web_extract` tools through DeepSeek's [Search & Fetch APIs](https://api-docs.deepseek.com/guides/search/). One file, no dependencies, and the invariants that would otherwise fail silently are pinned by the tests in `tests/`.
 
@@ -33,7 +35,7 @@ This plugin adds a **keyed, paid, deterministic** backend under your own account
 | `web_search` | managed free Perplexity | `deepseek` |
 | `web_extract` | free keyless ring (exa / parallel / firecrawl, rotating) | `deepseek` |
 | On failure | — | one-shot rescue back to the free keyless ring |
-| Cost | $0 | ≈$0.002 per successful call |
+| Cost | $0 | DeepSeek's list price: $0.75 per 1,000 successful calls |
 
 With both keys pinned, Hermes' `_managed_web_search()` returns `False` — the managed free route is bypassed. Reverting restores the previous routes exactly; nothing else in your config moves.
 
@@ -70,7 +72,7 @@ hermes plugins disable web/deepseek-search-fetch
 
 ## Costs, limits and behaviour
 
-**Billing.** DeepSeek charges **$0.75 per 1,000 successful requests**; failed calls, empty results and timeouts are free. Measured on 2026-10-16: **≈$0.002 per successful call**, about 2.7× the list rate — the balance endpoint reports two decimals, so treat $0.00075 as a floor and budget ~3×. A ~50-call research day lands near $0.10. Check your own usage with `GET https://api.deepseek.com/user/balance`.
+**Billing.** DeepSeek bills **$0.75 per 1,000 successful requests**; failed calls, empty results and timeouts are free. At that rate a 50-call research day is about $0.04, and a thousand calls is 75 cents. Rates change — check DeepSeek's pricing page — and check your own usage with `GET https://api.deepseek.com/user/balance`. **No per-call figure of our own is published here:** the account this plugin was developed against also carries other traffic, so a balance delta cannot be attributed to these calls.
 
 **Limits.** Queries are capped at **128 characters** by the API (longer → HTTP 400, free). `limit` is clamped to **1–50**. **5 requests/second** — a 429 is surfaced as an error rather than retried, and the rescue path covers it. Multi-URL extracts are bounded by Hermes' **120 s** per-provider cap.
 
