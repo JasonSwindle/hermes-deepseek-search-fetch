@@ -18,7 +18,7 @@ Routes [Hermes Agent](https://hermes-agent.nousresearch.com/docs)'s `web_search`
 | Registered provider | `deepseek` — the value `web.search_backend` / `web.extract_backend` hold |
 | Kind | `backend` — registers one web provider: no tools, no hooks |
 | Dependencies | none beyond the standard library and the `httpx` Hermes already ships |
-| Tests | 24 stdlib unit + contract tests, 6 Hypothesis property tests — offline, keyless, unbilled |
+| Tests | 33 stdlib unit + contract tests, 8 Hypothesis property tests — offline, keyless, unbilled |
 | Licence | MIT |
 | Affiliation | Community plugin by Jason Swindle. **Not affiliated with DeepSeek.** DeepSeek is a trademark of its owner; this is an independent client. |
 
@@ -152,10 +152,10 @@ See [Tests](#tests) — they need no key, no network and no Hermes install.
 Offline, keyless and unbilled: a loopback mock server stands in for the vendor, and a small stub lets the plugin import **without a Hermes install**, so the suite runs anywhere.
 
 ```bash
-# Zero-dependency tier (stdlib unittest only) — 25 tests
+# Zero-dependency tier (stdlib unittest only) — 34 tests (33 + a skip placeholder)
 python -m unittest discover -s tests
 
-# Full tier, adding Hypothesis property tests — 30 tests
+# Full tier, adding Hypothesis property tests — 41 tests
 uv venv .venv-dev
 uv pip install --python .venv-dev/bin/python -r requirements-dev.txt
 .venv-dev/bin/python -m unittest discover -s tests
