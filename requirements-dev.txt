@@ -1,0 +1,12 @@
+# Dev-only test extras — NOT runtime dependencies.
+#
+# The plugin itself imports only the standard library plus the httpx that Hermes
+# already ships; nothing here is loaded by the plugin or by Hermes. Install into
+# the throwaway dev venv, never into the Hermes venv:
+#
+#     uv venv .venv-dev && uv pip install --python .venv-dev/bin/python -r requirements-dev.txt
+#
+# hypothesis powers tests/test_properties.py, which is skipped automatically when
+# it is absent so the stdlib tier keeps running with zero dependencies.
+hypothesis==6.170.1
+httpx==0.28.1

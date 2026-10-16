@@ -1,0 +1,14 @@
+name: deepseek-search-fetch
+version: 1.0.0
+description: "Search the web and fetch pages via DeepSeek's Search & Fetch APIs."
+author: Jason Swindle
+license: MIT
+homepage: https://github.com/JasonSwindle/hermes-deepseek-search-fetch
+kind: backend
+provides_web_providers:
+  - deepseek
+requires_env:
+  - name: DEEPSEEK_API_KEY
+    description: "DeepSeek API key for the Search & Fetch tools (billed per successful request)."
+    url: https://platform.deepseek.com/api_keys
+    secret: true
