@@ -23,7 +23,8 @@ at it. Never aim the tests at the real API; nothing in `tests/` should ever need
 Falsification check (do this when you touch the sanitizer or the guard): make a copy
 of the plugin with `_utf8_safe` neutered to `return text`, run the suite with
 `DEEPSEEK_PLUGIN_PATH=<copy>`, and confirm it goes **red**. A suite that stays green
-against a broken copy proves nothing.
+against a broken copy proves nothing. Same for the unescaper: neuter
+`_unescape_markdown` to `return text` and confirm the extract tests go red.
 
 ## Invariants — these are pinned by tests
 
@@ -32,6 +33,10 @@ against a broken copy proves nothing.
   `raw_content`, `metadata`, or `error` per entry) — *not* the
   `{"success": …, "data": […]}` envelope the Hermes docs show elsewhere. The bundled
   providers return a bare list and the dispatcher consumes it that way.
+- Both `content` and `raw_content` hold the **unescaped** Markdown. The fetch endpoint
+  backslash-escapes every punctuation character, and Hermes prefers `raw_content` when it
+  derives the model-visible content and when it writes its extract cache — so unescaping
+  only one field reintroduces the escaping in every cached and budgeted result.
 - `is_available()` **must not** touch the network; it runs on every `hermes tools` paint.
 - Every outgoing query and URL is UTF-8-safe: unpaired surrogates become U+FFFD.
   httpx raises while *encoding* the body otherwise, so the call dies before it is sent.

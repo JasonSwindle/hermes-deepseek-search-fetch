@@ -67,6 +67,21 @@ def _utf8_safe(text: str) -> str:
     return _SURROGATE_RE.sub("\ufffd", text)
 
 
+# The fetch endpoint escapes every ASCII punctuation character in the page text:
+# headings arrive as a literal backslash-hash, links as escaped brackets and
+# colons, table pipes as escaped pipes. Left alone, "Markdown" renders as
+# punctuation instead of structure. The escaping is uniform, so its inverse is
+# too — only backslash + ASCII punctuation ([!-/:-@[-`{-~]) is unescaped, which
+# leaves letter escapes such as a literal backslash-n or a regex like
+# backslash-d untouched, because letters are not punctuation.
+_UNESCAPE_RE = re.compile(r"\\([!-/:-@\[-`{-~])")
+
+
+def _unescape_markdown(text: str) -> str:
+    """Undo the fetch endpoint's backslash escaping of page Markdown."""
+    return _UNESCAPE_RE.sub(r"\1", text)
+
+
 def _missing_key_error() -> str:
     return (
         "DEEPSEEK_API_KEY is not set. Add it for the web/deepseek plugin "
@@ -147,7 +162,12 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
             try:
                 data = self._post(_FETCH_URL, {"url": url})
                 title = data.get("title") or ""
-                content = data.get("content") or ""
+                # Both fields hold the unescaped Markdown on purpose: Hermes
+                # prefers raw_content when it derives the model-visible content
+                # and when it writes its extract cache, so leaving the vendor's
+                # escaping in raw_content would reintroduce it in every cached
+                # and budgeted result.
+                content = _unescape_markdown(data.get("content") or "")
                 out.append(
                     {
                         "url": url,

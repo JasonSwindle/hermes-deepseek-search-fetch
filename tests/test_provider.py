@@ -91,7 +91,12 @@ class Handler(BaseHTTPRequestHandler):
          "summary": "Mock Summary", "snippet": "ignored"},
         {"title": "Second", "url": "https://example.invalid/2", "snippet": "Only Snippet"},
     ]}).encode()
-    fetch_body: bytes = json.dumps({"title": "Mock Page", "content": "# Mock content"}).encode()
+    fetch_body: bytes = json.dumps({
+        "title": "Mock Page",
+        # Escaped exactly as /v1/tools/fetch returns it — every punctuation
+        # character backslashed — so the unescaping is falsifiable here.
+        "content": "\\# Mock content\n\nSee \\[the docs\\]\\(https\\:\\/\\/example\\.invalid\\/d\\) for more\\.",
+    }).encode()
 
     def log_message(self, *a):  # silence
         pass
@@ -203,6 +208,43 @@ class TestUtf8Safe(unittest.TestCase):
         self.mod._utf8_safe("lone \ud800 surrogate").encode("utf-8")
 
 
+# ── unit: fetch unescaping ────────────────────────────────────────────────────
+class TestUnescape(unittest.TestCase):
+    """The fetch endpoint escapes every punctuation character in page text.
+    `__init__.py` reverses exactly that, and nothing else."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load_plugin("unescape_mod", None)
+
+    def test_punctuation_escapes_are_removed(self):
+        u = self.mod._unescape_markdown
+        self.assertEqual(u("\\# Heading"), "# Heading")
+        self.assertEqual(u("a \\| b"), "a | b")
+        self.assertEqual(u("\\- item"), "- item")
+        self.assertEqual(u("100\\% done"), "100% done")
+
+    def test_link_markdown_is_restored(self):
+        u = self.mod._unescape_markdown
+        self.assertEqual(
+            u("\\[the docs\\]\\(https\\:\\/\\/example\\.invalid\\/d\\)"),
+            "[the docs](https://example.invalid/d)",
+        )
+
+    def test_letter_escapes_survive(self):
+        """Only punctuation is unescaped, so escapes and regexes in prose stay."""
+        u = self.mod._unescape_markdown
+        for text in ["a\\nb", "\\d+ digits", "\\u2014 dash", "C:\\path"]:
+            with self.subTest(text=text):
+                self.assertEqual(u(text), text)
+
+    def test_text_without_escapes_is_untouched(self):
+        u = self.mod._unescape_markdown
+        for text in ["plain", "# already clean", "🚀 emoji", "搜索与抓取"]:
+            with self.subTest(text=text):
+                self.assertEqual(u(text), text)
+
+
 # ── contract: search ──────────────────────────────────────────────────────────
 class TestSearchContract(MockVendor):
     def test_limit_clamped_and_payload_shape(self):
@@ -257,10 +299,23 @@ class TestExtractContract(MockVendor):
         self.assertEqual(len(out), 1)
         self.assertNotIn("error", out[0])
         self.assertEqual(out[0]["title"], "Mock Page")
-        self.assertEqual(out[0]["content"], "# Mock content")
-        self.assertEqual(out[0]["raw_content"], "# Mock content")
+        self.assertEqual(out[0]["content"], "# Mock content\n\nSee [the docs](https://example.invalid/d) for more.")
+        self.assertEqual(out[0]["raw_content"], out[0]["content"])
         self.assertEqual(out[0]["metadata"]["sourceURL"], "https://example.invalid/x")
         self.assertTrue(Handler.requests[-1]["path"].endswith(_FETCH))
+
+    def test_fetched_markdown_is_unescaped_in_both_fields(self):
+        """Hermes reads `raw_content` first — it derives the model-visible content
+        and the disk cache from it — so leaving the vendor's escaping there would
+        reintroduce it in every cached and budgeted result."""
+        out = provider("e_unesc", f"{self.base}/ok").extract(["https://example.invalid/x"])
+        for field in ("content", "raw_content"):
+            text = out[0][field]
+            with self.subTest(field=field):
+                self.assertNotIn("\\#", text)
+                self.assertNotIn("\\[", text)
+                self.assertRegex(text, r"^# Mock content")
+                self.assertIn("[the docs](https://example.invalid/d)", text)
 
     def test_empty_url_list(self):
         self.assertEqual(provider("e_empty", f"{self.base}/ok").extract([]), [])
