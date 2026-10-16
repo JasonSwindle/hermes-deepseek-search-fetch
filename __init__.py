@@ -84,7 +84,7 @@ def _unescape_markdown(text: str) -> str:
 
 def _missing_key_error() -> str:
     return (
-        "DEEPSEEK_API_KEY is not set. Add it for the web/deepseek plugin "
+        "DEEPSEEK_API_KEY is not set. Add it for the deepseek-search-fetch plugin "
         "(hermes tools -> Web Search) or unset the DeepSeek web backend."
     )
 
