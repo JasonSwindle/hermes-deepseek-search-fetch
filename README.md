@@ -41,14 +41,33 @@ With both keys pinned, Hermes' `_managed_web_search()` returns `False` — the m
 
 ## Install
 
+**From the plugin catalog** (once the entry is merged — find it with `hermes plugins search deepseek`):
+
+```bash
+hermes plugins install deepseek-search-fetch --enable
+```
+
+**Straight from this repository** (add `--ref <40-character sha>` to pin a specific reviewed commit):
+
+```bash
+hermes plugins install JasonSwindle/hermes-deepseek-search-fetch --enable
+```
+
+A git or catalog install lands as a **top-level plugin**, so it is enabled under the plugin name.
+A manual clone behaves the same if you clone to `~/.hermes/plugins/deepseek-search-fetch`; cloning
+under `plugins/web/` instead means the enable key is `web/deepseek-search-fetch`.
+
 ```bash
 git clone https://github.com/JasonSwindle/hermes-deepseek-search-fetch \
-  ~/.hermes/plugins/web/deepseek-search-fetch
+  ~/.hermes/plugins/deepseek-search-fetch
+hermes plugins enable deepseek-search-fetch
+```
 
-hermes plugins enable web/deepseek-search-fetch
+Then point the web tools at the provider and supply the key:
+
+```bash
 hermes config set web.search_backend deepseek
 hermes config set web.extract_backend deepseek
-
 export DEEPSEEK_API_KEY=***        # or store it in your Hermes secrets
 ```
 
@@ -59,7 +78,7 @@ Requires Hermes Agent and a DeepSeek API key; no extra packages. Changes take ef
 ```bash
 hermes config unset web.search_backend
 hermes config unset web.extract_backend
-hermes plugins disable web/deepseek-search-fetch
+hermes plugins disable deepseek-search-fetch
 ```
 
 ## How it works
