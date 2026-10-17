@@ -43,7 +43,7 @@ With both keys pinned, Hermes' `_managed_web_search()` returns `False` — the m
 
 ## Install
 
-**From the plugin catalog** (once the entry is merged — find it with `hermes plugins search deepseek`):
+**From the plugin catalog** — community tier, find it with `hermes plugins search deepseek`:
 
 ```bash
 hermes plugins install deepseek-search-fetch --enable

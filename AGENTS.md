@@ -92,6 +92,11 @@ Bump `version` in `plugin.yaml`, commit, tag if you like, then open a PR to
 `NousResearch/hermes-agent` adding/updating `plugin-catalog/deepseek-search-fetch.yaml`
 with the new full 40-character commit SHA (tags, branches and short SHAs are rejected).
 
+**Don't tag per edit.** Docs and asset changes land on `main` and ride the next release; a
+release is cut when something must be pinned — a plugin code change, or a catalog re-pin.
+A tag per README or image tweak is churn the catalog does not need, and each one is another
+number the entry has to explain.
+
 **Release titles are the bare tag** (`v1.0.3`), never `deepseek-search-fetch v1.0.3`.
 GitHub's releases sidebar and the repo home page truncate release names, so a
 prefixed title renders as `deepseek-search-fetch v1...` and hides the one thing the
