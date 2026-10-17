@@ -122,7 +122,8 @@ class Handler(BaseHTTPRequestHandler):
         if prefix.startswith("/body_meta"):
             return self._send(200, {"results": [
                 {"title": "Ranked", "url": "https://example.invalid/r1", "summary": "S1",
-                 "rerank_score": 2.4, "authority": 3, "date": "2026-06-01T00:00:00+00:00"},
+                 "rerank_score": 2.4, "authority": 3, "date": "2026-06-01T00:00:00+00:00",
+                 "site_name": "Example News", "site_icon": "https://example.invalid/favicon.ico"},
                 {"title": "Thin", "url": "https://example.invalid/r2", "snippet": "S2"},
             ]})
         if prefix.startswith("/shape_null"):
@@ -282,19 +283,22 @@ class TestSearchContract(MockVendor):
         self.assertEqual(out["data"]["web"][0], {
             "title": "Mock Title", "url": "https://example.invalid/1",
             "description": "Mock Summary", "position": 1,
-            "rerank_score": None, "authority": None, "date": None})
+            "rerank_score": None, "authority": None, "date": None,
+            "site_name": None, "site_icon": None})
         self.assertEqual(out["data"]["web"][1]["description"], "Only Snippet")
         self.assertEqual(out["data"]["web"][1]["position"], 2)
 
-    def test_quality_and_freshness_fields_are_mapped(self):
-        """A caller can filter on these without paying to fetch the page."""
+    def test_quality_freshness_and_provenance_are_mapped(self):
+        """A caller can filter and attribute a result set without fetching it."""
         out = provider("s_meta", f"{self.base}/body_meta").search("q", limit=2)
         first, second = out["data"]["web"]
         self.assertEqual(first["rerank_score"], 2.4)
         self.assertEqual(first["authority"], 3)
         self.assertEqual(first["date"], "2026-06-01T00:00:00+00:00")
+        self.assertEqual(first["site_name"], "Example News")
+        self.assertEqual(first["site_icon"], "https://example.invalid/favicon.ico")
         self.assertEqual(second["title"], "Thin")
-        for field in ("rerank_score", "authority", "date"):
+        for field in ("rerank_score", "authority", "date", "site_name", "site_icon"):
             with self.subTest(field=field):
                 self.assertIn(field, second)
                 self.assertIsNone(second[field])
@@ -465,7 +469,7 @@ class TestProviderContract(MockVendor):
         self.assertEqual(set(out), {"success", "data"})
         self.assertEqual(set(out["data"]), {"web"})
         expected = {"title", "url", "description", "position",
-                    "rerank_score", "authority", "date"}
+                    "rerank_score", "authority", "date", "site_name", "site_icon"}
         for hit in out["data"]["web"]:
             self.assertEqual(set(hit), expected)
 

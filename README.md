@@ -1,3 +1,5 @@
+![deepseek-search-fetch](docs/logo.png)
+
 # 🔍 deepseek-search-fetch — DeepSeek Search & Fetch as a Hermes web provider
 
 [![tests](https://github.com/JasonSwindle/hermes-deepseek-search-fetch/actions/workflows/tests.yml/badge.svg)](https://github.com/JasonSwindle/hermes-deepseek-search-fetch/actions/workflows/tests.yml)
@@ -6,7 +8,7 @@
 
 Routes [Hermes Agent](https://hermes-agent.nousresearch.com/docs)'s `web_search` and `web_extract` tools through DeepSeek's [Search & Fetch APIs](https://api-docs.deepseek.com/guides/search/). One file, no dependencies, and the invariants that would otherwise fail silently are pinned by the tests in `tests/`.
 
-- **Search** — `POST /v1/tools/search` → ranked hits with `title`, `url`, `description`, `position`, plus the vendor's quality and freshness signals: `rerank_score` (0–3; ≥1.5 is high quality), `authority` (0–4; `-1` unknown, ≥3 authoritative) and `date` (RFC 3339 UTC, or `null`)
+- **Search** — `POST /v1/tools/search` → ranked hits with `title`, `url`, `description`, `position`, plus the vendor's quality, freshness and provenance signals: `rerank_score` (0–3; ≥1.5 is high quality), `authority` (0–4; `-1` unknown, ≥3 authoritative), `date` (RFC 3339 UTC), `site_name` and `site_icon` — the last four `null` when the vendor omits them
 - **Fetch** — `POST /v1/tools/fetch` → Markdown per URL as `title` + `content`, with the vendor's punctuation escaping reversed so headings, links and tables arrive as Markdown instead of literal `\#` / `\[`
 - **Your key, your account** — calls go to `api.deepseek.com` and nowhere else; nothing is proxied, nothing phones home
 
@@ -84,7 +86,7 @@ hermes plugins disable deepseek-search-fetch
 ## How it works
 
 - Hermes resolves the provider from `web.search_backend` / `web.extract_backend` (falling back to `web.backend`, then its own preference walks). This plugin registers the name `deepseek`.
-- `search()` posts `{query, count}` — plus `need_content: true` when `DEEPSEEK_SEARCH_NEED_CONTENT` is set — and maps `results[]` into Hermes' hit shape, preferring each result's `summary` and falling back to `snippet`. Every hit also carries the vendor's `rerank_score`, `authority` and `date` (`None` when the vendor omits them), so a result set can be filtered before anything is fetched. With the opt-in on, each hit carries the page's `content` as clean Markdown too.
+- `search()` posts `{query, count}` — plus `need_content: true` when `DEEPSEEK_SEARCH_NEED_CONTENT` is set — and maps `results[]` into Hermes' hit shape, preferring each result's `summary` and falling back to `snippet`. Every hit also carries the vendor's `rerank_score`, `authority`, `date`, `site_name` and `site_icon` (`None` when the vendor omits them), so a result set can be filtered and attributed before anything is fetched. With the opt-in on, each hit carries the page's `content` as clean Markdown too.
 - `extract()` posts `{url}` **one URL per call** (the endpoint is single-URL), so multi-URL extracts run sequentially and preserve input order. Each entry carries `title`, `content`, `raw_content` and `metadata.sourceURL`, with **both** content fields holding the unescaped Markdown (see below).
 - Failures never raise: a bad call returns an error envelope (or a per-entry `error`), which is exactly what lets Hermes' rescue logic see it and fall over to the free ring.
 - `is_available()` is an environment check only — Hermes calls it on every `hermes tools` paint, so it must never touch the network.
@@ -99,6 +101,7 @@ hermes plugins disable deepseek-search-fetch
 
 - Unpaired surrogate code points in a query or URL are replaced with U+FFFD first: `httpx` raises while *encoding* the body otherwise, so the call would die before leaving the process.
 - **Fetched Markdown arrives backslash-escaped, and this plugin reverses it.** `/v1/tools/fetch` escapes every ASCII punctuation character in the page text — a page's `# Heading` comes back as `\# Heading`, links as `\[text\]\(https\:\/\/…\)`, table pipes as `\|` — so the text renders as punctuation rather than structure. `extract()` unescapes backslash-plus-punctuation in **both** `content` and `raw_content`. Both, not one: Hermes prefers `raw_content` when it derives the model-visible content and when it writes its extract cache, so a half-fix would keep serving escaped text out of the cache. Letter escapes survive untouched (`\n`, `\d+`, `C:\path`), and a page whose own source deliberately escaped punctuation will have that escape removed too — the vendor's escaping is uniform, so no rule can tell the two apart.
+- **Two documented request fields are deliberately not forwarded.** `ori_question` ("the user's original question") and `localization` (an IP used to localise results) exist on the Search API and are accepted by it, but Hermes' provider interface hands `search()` only `(query, limit)`: the user's question never reaches the plugin, so echoing `query` into `ori_question` would add nothing, and there is no config surface for an IP. Tracked upstream, not worked around. `need_content` is the third: per-request on the API, but toggleable here only process-wide via `DEEPSEEK_SEARCH_NEED_CONTENT`.
 - Empty search results are success with an empty list, not an error.
 - **Search returns metadata only unless you ask for content.** `need_content` is a per-request option on the Search API, and this plugin sends it only when `DEEPSEEK_SEARCH_NEED_CONTENT` is truthy — one search then carries the pages' text, where getting the same text otherwise costs one Fetch call per URL. It is off by default because that text is 2–5 KB per result, and Hermes' own `web_search` contract is metadata-only ("use `web_extract` for page content"). When it is on, the search endpoint's `content` needs no unescaping — that escaping is a fetch-endpoint behaviour.
 - `extract()` returns a **bare list** of entries. Parts of the Hermes docs show a `{"success": …, "data": […]}` envelope instead; the bundled providers return a bare list and the dispatcher consumes it that way, so this matches bundled behaviour deliberately — pinned by a test.
