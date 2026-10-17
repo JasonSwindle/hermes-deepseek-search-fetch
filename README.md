@@ -1,6 +1,6 @@
 ![deepseek-search-fetch](docs/logo.png)
 
-# 🔍 deepseek-search-fetch — DeepSeek Search & Fetch as a Hermes web provider
+# DeepSeek Search & Fetch
 
 [![tests](https://github.com/JasonSwindle/hermes-deepseek-search-fetch/actions/workflows/tests.yml/badge.svg)](https://github.com/JasonSwindle/hermes-deepseek-search-fetch/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
