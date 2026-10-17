@@ -85,3 +85,9 @@ against a broken copy proves nothing. Same for the unescaper: neuter
 Bump `version` in `plugin.yaml`, commit, tag if you like, then open a PR to
 `NousResearch/hermes-agent` adding/updating `plugin-catalog/deepseek-search-fetch.yaml`
 with the new full 40-character commit SHA (tags, branches and short SHAs are rejected).
+
+**Release titles are the bare tag** (`v1.0.3`), never `deepseek-search-fetch v1.0.3`.
+GitHub's releases sidebar and the repo home page truncate release names, so a
+prefixed title renders as `deepseek-search-fetch v1...` and hides the one thing the
+row exists to show. `/releases/latest` and the tag both stay `v1.0.3` either way, so
+nothing is lost by keeping the name short.
