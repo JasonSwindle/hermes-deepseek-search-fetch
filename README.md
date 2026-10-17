@@ -1,12 +1,12 @@
 ![deepseek-search-fetch](docs/logo.png)
 
-# DeepSeek Search & Fetch
+# DeepSeek Search & Fetch as a Hermes web provider
 
 [![tests](https://github.com/JasonSwindle/hermes-deepseek-search-fetch/actions/workflows/tests.yml/badge.svg)](https://github.com/JasonSwindle/hermes-deepseek-search-fetch/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes Agent plugin](https://img.shields.io/badge/Hermes-Agent%20plugin-8A63D2.svg)](https://github.com/NousResearch/hermes-agent)
 
-Routes [Hermes Agent](https://hermes-agent.nousresearch.com/docs)'s `web_search` and `web_extract` tools through DeepSeek's [Search & Fetch APIs](https://api-docs.deepseek.com/guides/search/). One file, no dependencies, and the invariants that would otherwise fail silently are pinned by the tests in `tests/`.
+Wires DeepSeek's [Search & Fetch APIs](https://api-docs.deepseek.com/guides/search/) into [Hermes Agent](https://hermes-agent.nousresearch.com/docs)'s `web_search` and `web_extract`. One file, no dependencies, and the invariants that would otherwise fail silently are pinned by the tests in `tests/`.
 
 - **Search** — `POST /v1/tools/search` → ranked hits with `title`, `url`, `description`, `position`, plus the vendor's quality, freshness and provenance signals: `rerank_score` (0–3; ≥1.5 is high quality), `authority` (0–4; `-1` unknown, ≥3 authoritative), `date` (RFC 3339 UTC), `site_name` and `site_icon` — the last four `null` when the vendor omits them
 - **Fetch** — `POST /v1/tools/fetch` → Markdown per URL as `title` + `content`, with the vendor's punctuation escaping reversed so headings, links and tables arrive as Markdown instead of literal `\#` / `\[`
