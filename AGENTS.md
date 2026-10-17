@@ -68,10 +68,14 @@ against a broken copy proves nothing. Same for the unescaper: neuter
 - `__init__.py` — the entire plugin. `plugin.yaml` — manifest (`kind: backend`,
   `provides_web_providers: [deepseek]`).
 - `docs/` — brand assets only (`logo.png` 512×512, `banner.png` 1200×600 for the catalog card's
-  2:1 `image` field). Both carry **transparency outside the badge** on purpose: one file then reads
-  correctly on a light card and a dark one, since there is no per-theme image field in the catalog.
-  Images are not code: `hermes plugins validate` passes with them present, and the catalog requires
-  card images on `raw.githubusercontent.com` pinned to the entry's sha.
+  2:1 `image` field, `social-preview.png` 1280×640 for GitHub's link-unfurl card). `logo.png` and
+  `banner.png` carry **transparency outside the badge** on purpose: one file then reads correctly on
+  a light card and a dark one, since there is no per-theme image field in the catalog. Images are not
+  code: `hermes plugins validate` passes with them present, and the catalog requires card images on
+  `raw.githubusercontent.com` pinned to the entry's sha.
+- **The social preview is uploaded by hand, once.** GitHub exposes no REST or GraphQL endpoint for
+  it (Settings → General → Social preview is the only route), so the repo cannot set it in CI:
+  `docs/social-preview.png` is the source of truth, and it was last uploaded manually.
 - **Two names, on purpose:** the plugin/package name is `deepseek-search-fetch`, the
   *registered provider* name is `deepseek` — that second one is what users put in
   `web.search_backend`, and it stays bare because that is how Hermes names web
