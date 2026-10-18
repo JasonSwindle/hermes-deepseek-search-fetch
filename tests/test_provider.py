@@ -436,7 +436,8 @@ class TestSearchContract(MockVendor):
         """"true" in a hand-edited config is not consent; a bool or nothing."""
         os.environ.pop("DEEPSEEK_SEARCH_NEED_CONTENT", None)
         mod = load_plugin("s_nc_setting_str", f"{self.base}/body_content")
-        p = mod.DeepSeekWebSearchProvider(lambda key: "true")
+        p = mod.DeepSeekWebSearchProvider(
+            lambda key: "true" if key == "need_content" else None)
         p.search("q", limit=2)
         self.assertEqual(self.last_body(), {"query": "q", "count": 2})
 
@@ -451,6 +452,36 @@ class TestSearchContract(MockVendor):
         out = mod.DeepSeekWebSearchProvider(boom).search("q", limit=2)
         self.assertTrue(out["success"])
         self.assertEqual(self.last_body(), {"query": "q", "count": 2})
+
+    def test_localization_setting_is_sent(self):
+        """A set IP reaches the wire, next to the query and count."""
+        mod = load_plugin("s_loc_on", f"{self.base}/body_content")
+        p = mod.DeepSeekWebSearchProvider(
+            lambda key: "203.0.113.7" if key == "localization" else None)
+        p.search("q", limit=2)
+        self.assertEqual(self.last_body(),
+                         {"query": "q", "count": 2, "localization": "203.0.113.7"})
+
+    def test_localization_is_not_sent_when_unset(self):
+        """Unset, empty and whitespace all mean "no localisation"."""
+        for index, value in enumerate((None, "", "   ")):
+            with self.subTest(value=value):
+                mod = load_plugin(f"s_loc_off_{index}", f"{self.base}/body_content")
+                p = mod.DeepSeekWebSearchProvider(lambda key, v=value: v)
+                out = p.search("q", limit=2)
+                self.assertTrue(out["success"])
+                self.assertNotIn("localization", self.last_body())
+
+    def test_a_junk_localization_is_not_sent(self):
+        """The API takes an IP; anything else is refused here, not billed."""
+        for index, value in enumerate(("not-an-ip", "1.2.3.4.5", "::zzz", 203, True)):
+            with self.subTest(value=value):
+                os.environ.pop("DEEPSEEK_SEARCH_NEED_CONTENT", None)
+                mod = load_plugin(f"s_loc_bad_{index}", f"{self.base}/body_content")
+                p = mod.DeepSeekWebSearchProvider(lambda key, v=value: v)
+                out = p.search("q", limit=2)
+                self.assertTrue(out["success"])
+                self.assertNotIn("localization", self.last_body())
 
     def test_query_is_utf8_sanitised_before_send(self):
         p = provider("s_sur", f"{self.base}/ok")

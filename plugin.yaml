@@ -17,3 +17,7 @@ config_schema:
     type: bool
     default: false
     description: "Send need_content so each search hit carries its page text as clean Markdown. Off by default: 2–5 KB per result. A query already in Hermes' 20-minute search cache keeps its cached shape until the cache expires."
+  localization:
+    type: str
+    default: ""
+    description: "Optional IP address the Search API localises results to. Empty sends nothing; a value that is not an IP is ignored with a warning rather than sent."

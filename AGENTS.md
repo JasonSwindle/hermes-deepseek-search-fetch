@@ -45,6 +45,14 @@ against a broken copy proves nothing. Same for the unescaper: neuter
   derives the model-visible content and when it writes its extract cache — so unescaping
   only one field reintroduces the escaping in every cached and budgeted result.
 - `is_available()` **must not** touch the network; it runs on every `hermes tools` paint.
+- `need_content` and `localization` are read from the plugin's own settings on every search
+  (`ctx.get_config`, wired in `register()`); a host without that surface leaves the reader `None`
+  and the code falls back to `DEEPSEEK_SEARCH_NEED_CONTENT` for the first and to "not set" for the
+  second. A failing read is "off", never an exception out of `search()`. `localization` is sent only
+  when `ipaddress.ip_address` accepts it — the API takes an IP, so anything else would be a billed 400.
+- `hermes plugins validate .` on a working tree that carries `.venv-dev/` fails its security scan on
+  the virtualenv (`.so` files, symlinks, trio's sockets). That is the dev tree, not the plugin:
+  validate a clean export (`git archive HEAD | tar -x -C <dir>`) or the catalog install path.
 - Every outgoing query and URL is UTF-8-safe: unpaired surrogates become U+FFFD.
   httpx raises while *encoding* the body otherwise, so the call dies before it is sent.
 - `DEEPSEEK_BASE_URL` is accepted only as `https://api.deepseek.com` (https) or a

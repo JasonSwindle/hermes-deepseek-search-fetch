@@ -11,6 +11,7 @@ and httpx (both guaranteed present — every sibling provider uses httpx).
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -115,6 +116,7 @@ def _unescape_markdown(text: str) -> str:
 # from DEEPSEEK_SEARCH_NEED_CONTENT=1 (or true/yes/on).
 _NEED_CONTENT_ENV = "DEEPSEEK_SEARCH_NEED_CONTENT"
 _NEED_CONTENT_SETTING = "need_content"
+_LOCALIZATION_SETTING = "localization"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
@@ -143,6 +145,33 @@ def _need_content_enabled(get_setting=None) -> bool:
         if isinstance(value, bool):
             return value
     return _env_need_content()
+
+
+def _localization(get_setting=None) -> str:
+    """The Search API's `localization` IP, or "" when it is not usable.
+
+    The API takes an IP address for this field, so anything else is refused
+    here with a warning instead of being sent and billed as a 400. A setting
+    that is not a string is ignored the same way; an unavailable settings
+    surface is simply "not set".
+    """
+    if get_setting is None:
+        return ""
+    try:
+        value = get_setting(_LOCALIZATION_SETTING)
+    except Exception:  # never raise out of a capability
+        return ""
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if not value:
+        return ""
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        logger.warning("Ignoring %s setting %r: not an IP address", _LOCALIZATION_SETTING, value)
+        return ""
+    return value
 
 
 def _missing_key_error() -> str:
@@ -351,6 +380,9 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
             payload: dict[str, Any] = {"query": query, "count": count}
             if want_content:
                 payload["need_content"] = True
+            localization = _localization(self._get_setting)
+            if localization:
+                payload["localization"] = localization
             data = self._post(_SEARCH_URL, payload)
             rows = data.get("results") or []
             hits: list[dict[str, Any]] = []
