@@ -20,7 +20,7 @@ Wires DeepSeek's [Search & Fetch APIs](https://api-docs.deepseek.com/guides/sear
 | Registered provider | `deepseek` — the value `web.search_backend` / `web.extract_backend` hold |
 | Kind | `backend` — registers one web provider: no tools, no hooks |
 | Dependencies | none beyond the standard library and the `httpx` Hermes already ships |
-| Tests | 51 stdlib unit + contract tests, 8 Hypothesis property tests — offline, keyless, unbilled |
+| Tests | 66 stdlib unit + contract tests, 8 Hypothesis property tests — offline, keyless, unbilled — plus `dsweb-integration.py`, 19 checks against a real Hermes install |
 | Licence | MIT |
 | Affiliation | Community plugin by Jason Swindle. **Not affiliated with DeepSeek.** DeepSeek is a trademark of its owner; this is an independent client. |
 
@@ -95,7 +95,9 @@ hermes plugins disable deepseek-search-fetch
 
 **Billing.** DeepSeek bills **$0.75 per 1,000 successful requests**; failed calls, empty results and timeouts are free. At that rate a 50-call research day is about $0.04, and a thousand calls is 75 cents. Rates change — check DeepSeek's pricing page — and check your own usage with `GET https://api.deepseek.com/user/balance`. **No per-call figure of our own is published here:** the account this plugin was developed against also carries other traffic, so a balance delta cannot be attributed to these calls.
 
-**Limits.** Queries are capped at **128 characters** by the API (longer → HTTP 400, free). `limit` is clamped to **1–50**. Search and Fetch are each **5 requests/second** per account. HTTP 408, 429 and any 5xx are retried up to twice on that same call: the waits are 1s and then 2s, each plus up to 0.25s of jitter, and the budget is checked after each attempt, so a single search can take up to about **61 s** before it returns an error — two 30 s attempts plus the 1 s wait between them. A `Retry-After` that is a positive number of seconds replaces that attempt's wait, jitter included, when it is no longer than the wait; an HTTP-date, zero, a negative, or a longer value leaves the scheduled wait in place. A 402 is sent once and tells you to top up the account. Every other 4xx is sent once. Whatever still fails comes back as an error envelope, which Hermes can rescue from the free ring. A multi-URL extract stops starting further requests 85s after it began, so pages already fetched are returned before Hermes' **120 s** cap discards the batch; a call stopped mid-retry by that deadline reports the last HTTP status it saw, with its retry count, rather than a deadline message of its own.
+**Limits.** Queries are capped at **128 characters** by the API (longer → HTTP 400, free). `limit` is clamped to **1–50**. Search and Fetch are each **5 requests/second** per account. HTTP 408, 429 and any 5xx are retried up to twice on that same call: the waits are 1s and then 2s, each plus up to 0.25s of jitter. The **40 s budget bounds the whole call, not just the wait** — a retry is only scheduled when the attempt it schedules still fits, so a search that meets a slow 5xx ends in about 40 s rather than spending a further 30 s attempt past it. A `Retry-After` in seconds is honoured whenever the call can afford the wait, replacing that attempt's wait entirely; when it asks for more time than the budget has left, the call stops retrying rather than waiting less than the server asked. (An HTTP-date, zero or a negative value is ignored and the backoff stands.) A 402 is sent once and tells you to top up the account. Every other 4xx is sent once. Whatever still fails comes back as an error envelope, which Hermes can rescue from the free ring.
+
+A multi-URL extract stops starting requests **110 s** after it began, and each request is given only the time the deadline has left — `httpx` timeouts are per connect/read, not wall-clock, so a body that trickles in can outlive a nominal 30 s timeout. Worst case is 110 s plus the 0.5 s floor, inside Hermes' default **120 s** cap, so pages already fetched are returned instead of the batch being discarded. That margin is **only safe while `web.extract_timeout` is at least 120**: the plugin cannot read that setting, so if you lower it, lower the `extract_deadline` setting to match (it clamps to 5–115 s).
 
 **Behaviour worth knowing.**
 
@@ -148,6 +150,7 @@ The plugin declares its own settings, so they appear in Hermes' plugin form — 
 |---|---|---|---|
 | `need_content` | boolean | off | Sends `need_content: true`: every search hit carries its page text as clean Markdown. Costs 2–5 KB per result. |
 | `localization` | string | empty | An IP address the Search API localises results to. Empty sends nothing; a value that is not an IP is ignored with a warning rather than sent and billed as a 400. |
+| `extract_deadline` | integer | 110 | Seconds one multi-URL `extract()` may spend starting requests. Clamped to 5–115. Lower it to match a lowered `web.extract_timeout`; the plugin cannot read that setting. |
 
 A setting is read on every search, and Hermes' config cache is keyed on the config file's signature, so a change lands on the **next search** — no session restart. One caveat: Hermes caches successful search responses for `web.cache_ttl_minutes` (20 by default) against the query, so a query already answered before the change keeps its old shape until that entry expires.
 
@@ -161,8 +164,8 @@ Settings live under `plugins.entries.<id>.settings.<key>`, and `<id>` depends on
 | Page content on search results | `need_content` setting, or `DEEPSEEK_SEARCH_NEED_CONTENT` | Off by default. The setting wins when it is set; the environment variable is the fallback for hosts without a settings surface, accepting `1` (or `true`/`yes`/`on`). Either one sends `need_content: true` — every hit then carries its page text as clean Markdown, at 2–5 KB per result in the tool result and the context window. |
 | Result cap | `_SEARCH_LIMIT_CAP` in `__init__.py` | `50` — DeepSeek's own maximum. |
 | Timeout | `_TIMEOUT` in `__init__.py` | `30.0` s per HTTP call. |
-| Transient retries | `_RETRY_BACKOFF_S`, `_RETRY_JITTER_S`, `_RETRY_BUDGET_S` in `__init__.py` | One further attempt per backoff entry (currently 1s then 2s), plus up to 0.25s of jitter. The call stops retrying once it has spent 40s. A shorter positive `Retry-After`, in seconds, replaces that attempt's wait. |
-| Extract batch deadline | `_EXTRACT_DEADLINE_S` in `__init__.py` | `85` s from the start of one `extract()`. Later URLs are not requested; pages already fetched stay in the list. |
+| Transient retries | `_RETRY_BACKOFF_S`, `_RETRY_JITTER_S`, `_RETRY_BUDGET_S` in `__init__.py` | One further attempt per backoff entry (currently 1s then 2s), plus up to 0.25s of jitter. The 40s budget bounds the call: a retry is only scheduled when that attempt still fits, so a slow 5xx ends the call instead of spending 30s past the budget. A `Retry-After` in seconds replaces that attempt's wait when affordable, and ends the retries when it is not. |
+| Extract batch deadline | `extract_deadline` setting, `_EXTRACT_DEADLINE_S` in `__init__.py` | `110` s from the start of one `extract()`, and each request gets only the time left (httpx timeouts are per read, not wall-clock). Later URLs are not requested; pages already fetched stay in the list. Must stay below `web.extract_timeout − 0.5`. |
 | Provider name | `provides_web_providers` in `plugin.yaml` | `deepseek`; changing it changes what your config must say. |
 
 ## Tests
@@ -170,10 +173,10 @@ Settings live under `plugins.entries.<id>.settings.<key>`, and `<id>` depends on
 Offline, keyless and unbilled: a loopback mock server stands in for the vendor, and a small stub lets the plugin import **without a Hermes install**, so the suite runs anywhere.
 
 ```bash
-# Zero-dependency tier (stdlib unittest only) — 60 tests (59 + a skip placeholder)
+# Zero-dependency tier (stdlib unittest only) — 67 tests (66 + a skip placeholder)
 python -m unittest discover -s tests
 
-# Full tier, adding Hypothesis property tests — 67 tests
+# Full tier, adding Hypothesis property tests — 74 tests
 uv venv .venv-dev
 uv pip install --python .venv-dev/bin/python -r requirements-dev.txt
 .venv-dev/bin/python -m unittest discover -s tests

@@ -65,19 +65,34 @@ _SEARCH_LIMIT_CAP = 50  # DeepSeek count: 1-50
 # once. The wait is per call. Search and Fetch have separate 5 QPS account
 # caps, Fetch adds a per-domain cap, and other processes on the account are
 # invisible here, so a queue in this process would not be the account's limit.
-# Two quick retries clear a one-second QPS bucket. The 40s budget leaves a slow
-# 5xx (each attempt may use the whole 30s timeout) room for one retry. Extract
-# walks URLs one by one, and Hermes abandons the whole batch at 120s — pages
-# already fetched included — so the batch itself stops starting requests at 85s.
-# One attempt still in flight can use the 30s timeout and the call returns
-# inside the default cap.
+# Two quick retries clear a one-second QPS bucket.
+#
+# The 40s budget bounds the CALL, not just the wait: a retry is only scheduled
+# when the attempt it schedules still fits inside the budget, so a slow call
+# cannot spend a third 30s attempt past it.
+#
+# Extract walks URLs one by one, and Hermes abandons the whole batch at 120s —
+# pages already fetched included. Two things keep the batch inside that cap.
+# httpx timeouts are per connect/read, NOT wall-clock: a body that trickles in
+# fast enough to reset the read timer outlives _TIMEOUT, so a deadline that
+# gated only the start of an attempt would bound nothing. Each attempt gets
+# only the time the deadline has left, capped at _TIMEOUT, and the batch stops
+# starting requests at the deadline — worst case deadline + _REQUEST_FLOOR_S.
 # The limit is the length of the backoff list, so adding a wait cannot
 # index off the end of the tuple.
 _RETRY_BACKOFF_S = (1.0, 2.0)
 _RETRY_LIMIT = len(_RETRY_BACKOFF_S)
 _RETRY_JITTER_S = 0.25
 _RETRY_BUDGET_S = 40.0
-_EXTRACT_DEADLINE_S = 85.0
+_REQUEST_FLOOR_S = 0.5
+# 110 plus the 0.5s floor sits inside Hermes' default 120s cap with room for the
+# thread hop, and leaves the rest of the window to pages that would otherwise
+# never be started. Lower it when web.extract_timeout is lowered — the plugin
+# cannot read that setting, so the two numbers have to be kept in step by hand.
+_EXTRACT_DEADLINE_S = 110.0
+_EXTRACT_DEADLINE_SETTING = "extract_deadline"
+_EXTRACT_DEADLINE_MIN_S = 5.0
+_EXTRACT_DEADLINE_MAX_S = 115.0
 _BATCH_DEADLINE = "batch deadline reached"
 _DETAIL_CAP = 300
 _TOP_UP = "Top up the DeepSeek account before retrying."
@@ -174,6 +189,24 @@ def _localization(get_setting=None) -> str:
     return value
 
 
+def _extract_deadline(get_setting=None) -> float:
+    """Seconds one ``extract()`` may spend starting requests.
+
+    A setting exists because the number has to be kept below Hermes'
+    ``web.extract_timeout`` (120 by default) and the plugin cannot read that
+    setting — it is not plugin-scoped. Anything unusable falls back to the
+    built-in value, clamped, so a bad setting can never uncap the batch.
+    """
+    if get_setting is not None:
+        try:
+            value = get_setting(_EXTRACT_DEADLINE_SETTING)
+        except Exception:  # never raise out of a capability
+            value = None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return min(max(float(value), _EXTRACT_DEADLINE_MIN_S), _EXTRACT_DEADLINE_MAX_S)
+    return _EXTRACT_DEADLINE_S
+
+
 def _missing_key_error() -> str:
     return (
         "DEEPSEEK_API_KEY is not set. Add it for the deepseek-search-fetch plugin "
@@ -197,8 +230,9 @@ def _retry_suffix(retries: int) -> str:
 def _retry_after_seconds(value: str | None) -> float | None:
     """The header's whole value, when it is a positive number of seconds.
 
-    HTTP-dates, zero, negatives and non-numeric text are ignored. The caller
-    also ignores a value longer than this attempt's own backoff.
+    HTTP-dates, zero, negatives, infinities and non-numeric text are ignored.
+    The caller honours any affordable value and stops retrying when the wait it
+    asks for does not fit inside the call's budget.
     """
     if value is None:
         return None
@@ -211,18 +245,9 @@ def _retry_after_seconds(value: str | None) -> float | None:
     return seconds
 
 
-def _retry_delay(resp: httpx.Response, retries: int) -> float:
-    """Backoff for this attempt, or Retry-After when it is a shorter wait.
-
-    Retry-After replaces the whole delay, jitter included. A value longer than
-    this attempt's backoff, or one this function cannot parse, leaves the
-    backoff and its jitter in place.
-    """
-    backoff = _RETRY_BACKOFF_S[retries]
-    seconds = _retry_after_seconds(resp.headers.get("Retry-After"))
-    if seconds is not None and seconds <= backoff:
-        return seconds
-    return backoff + _uniform(0.0, _RETRY_JITTER_S)
+def _backoff_delay(retries: int) -> float:
+    """The scheduled wait before retry ``retries + 1``, jitter included."""
+    return _RETRY_BACKOFF_S[retries] + _uniform(0.0, _RETRY_JITTER_S)
 
 
 def _error_message(raw: str) -> str | None:
@@ -264,8 +289,13 @@ def _uniform(low: float, high: float) -> float:
     return random.uniform(low, high)
 
 
-def _request(url: str, payload: dict[str, Any], headers: dict[str, str]) -> httpx.Response:
-    return httpx.post(url, json=payload, headers=headers, timeout=_TIMEOUT)
+def _request(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout: float = _TIMEOUT,
+) -> httpx.Response:
+    return httpx.post(url, json=payload, headers=headers, timeout=timeout)
 
 
 def _status_error(resp: httpx.Response, retries: int) -> RuntimeError:
@@ -323,6 +353,12 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
                 if held is None:
                     raise RuntimeError(_BATCH_DEADLINE)
                 raise _status_error(held, retries)
+            attempt_timeout = _TIMEOUT
+            if deadline is not None:
+                # httpx timeouts are per connect/read, not wall-clock: give the
+                # attempt only what the deadline has left, or a body that trickles
+                # in fast enough to reset the read timer outlives both.
+                attempt_timeout = min(_TIMEOUT, max(_REQUEST_FLOOR_S, deadline - _monotonic()))
             try:
                 resp = _request(
                     url,
@@ -331,6 +367,7 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
                         "Authorization": f"Bearer {get_provider_env('DEEPSEEK_API_KEY')}",
                         "Content-Type": "application/json",
                     },
+                    timeout=attempt_timeout,
                 )
             except httpx.TransportError as exc:
                 # A dropped connection is not one of the documented statuses.
@@ -358,8 +395,14 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
                 or elapsed >= _RETRY_BUDGET_S
             ):
                 raise _status_error(resp, retries)
-            delay = _retry_delay(resp, retries)
-            past_budget = elapsed + delay >= _RETRY_BUDGET_S
+            # Retry-After is an instruction, not a hint: honour it when this call
+            # can afford the wait, and stop retrying when it cannot. Waiting less
+            # than the server asked would just earn another 429 — sooner.
+            retry_after = _retry_after_seconds(resp.headers.get("Retry-After"))
+            delay = retry_after if retry_after is not None else _backoff_delay(retries)
+            # The budget bounds the call: only schedule an attempt that still
+            # fits inside it, or a slow 5xx spends 30s past a 40s budget.
+            past_budget = elapsed + delay + _TIMEOUT > _RETRY_BUDGET_S
             past_deadline = deadline is not None and now + delay >= deadline
             if past_budget or past_deadline:
                 raise _status_error(resp, retries)
@@ -419,7 +462,7 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
         if not self.is_available():
             err = _missing_key_error()
             return [{"url": u, "title": "", "content": "", "error": err} for u in urls]
-        deadline = _monotonic() + _EXTRACT_DEADLINE_S
+        deadline = _monotonic() + _extract_deadline(self._get_setting)
         out: list[dict[str, Any]] = []
         for url in urls:
             try:

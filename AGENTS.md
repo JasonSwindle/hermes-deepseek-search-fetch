@@ -30,6 +30,11 @@ It installs the plugin into a throwaway HERMES_HOME through `hermes plugins inst
 points it at a loopback mock, and drives the real dispatcher: settings at call time, retry counts,
 extract unescaping, per-URL errors, the search-memo caveat. Run it before every release pin.
 
+`hermes plugins validate` warns "private core imports" on that script (`tools.web_tools` — catalog
+rule 9). That is expected and only a warning: the script *is* the integration tier, so it has to
+drive the real dispatcher, while the plugin's own runtime imports stay on the documented ABC. Keep
+the import out of `__init__.py`.
+
 Falsification check (do this when you touch the sanitizer or the guard): make a copy
 of the plugin with `_utf8_safe` neutered to `return text`, run the suite with
 `DEEPSEEK_PLUGIN_PATH=<copy>`, and confirm it goes **red**. A suite that stays green
@@ -71,12 +76,20 @@ against a broken copy proves nothing. Same for the unescaper: neuter
 - No `limit` outside 1–50 may reach the API, and the key must never be logged.
 - Retries are only for HTTP 408, 429 and 5xx, at most once per entry of
   `_RETRY_BACKOFF_S`. A 200 whose body is not JSON still carries that retry count.
-  A positive `Retry-After` in seconds replaces an attempt's wait when it is no
-  longer than that attempt's backoff. Retry log lines carry the status and the
-  attempt number, and they follow the key rule above.
-- A multi-URL `extract()` stops starting requests `_EXTRACT_DEADLINE_S` after it
-  began, so pages already fetched survive Hermes' extract timeout: they stay in
-  the returned list and only the skipped URLs carry an error.
+  `_RETRY_BUDGET_S` bounds the **call**, not just the wait: a retry is scheduled
+  only when `elapsed + delay + _TIMEOUT` still fits, because an attempt can spend
+  the whole 30s timeout. A `Retry-After` in seconds replaces that attempt's wait
+  when the budget can afford it, and ends the retries when it cannot — retrying
+  sooner than the server asked just earns another 429. Retry log lines carry the
+  status and the attempt number, and they follow the key rule above.
+- An `extract()` attempt is given `min(_TIMEOUT, deadline - now)` as its httpx
+  timeout, because httpx timeouts are per connect/read and **not** wall-clock: a
+  body that trickles in fast enough to reset the read timer outlives 30s, and the
+  batch then overruns Hermes' 120s cap, which discards every page fetched. Worst
+  case is `extract_deadline + _REQUEST_FLOOR_S`; `_EXTRACT_DEADLINE_MAX_S +
+  _REQUEST_FLOOR_S <= 120` is pinned by a test. Lowering `web.extract_timeout`
+  below that gap means lowering the `extract_deadline` setting too — the plugin
+  cannot read Hermes' web config, which is not plugin-scoped.
 
 ## Do not
 

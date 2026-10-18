@@ -109,9 +109,9 @@ def fast_clock(mod, advance: float = 0.0):
         state["sleeps"].append(seconds)
         state["now"] += seconds
 
-    def request(url, payload, headers):
+    def request(url, payload, headers, **kwargs):
         state["now"] += advance
-        return real_request(url, payload, headers)
+        return real_request(url, payload, headers, **kwargs)
 
     mod._monotonic = monotonic
     mod._sleep = sleep
@@ -161,6 +161,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(429, _RATE_LIMIT, {"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"})
         if prefix.startswith("/ra_zero"):
             return self._send(429, _RATE_LIMIT, {"Retry-After": "0"})
+        if prefix.startswith("/ra_equal"):
+            return self._send(429, _RATE_LIMIT, {"Retry-After": "1"})
+        if prefix.startswith("/ra_huge"):
+            return self._send(429, _RATE_LIMIT, {"Retry-After": "30"})
         if prefix.startswith("/long400"):
             return self._send(400, {"error": {"message": "m" * 400, "type": "invalid_request_error",
                                               "param": None, "code": "invalid_request_error"}})
@@ -722,7 +726,7 @@ class TestErrorPaths(MockVendor):
         self.assertEqual(clock["sleeps"], [0.5, 0.5])
 
     def test_retry_after_is_ignored_unless_it_is_a_short_delay(self):
-        for name in ("ra_long", "ra_date", "ra_zero"):
+        for name in ("ra_date", "ra_zero"):
             with self.subTest(name=name):
                 Handler.requests.clear()
                 mod = load_plugin(name, f"{self.base}/{name}")
@@ -731,21 +735,56 @@ class TestErrorPaths(MockVendor):
                 mod.DeepSeekWebSearchProvider().search("q")
                 self.assertEqual(clock["sleeps"], [1.25, 2.25])
 
+    def test_retry_after_equal_to_the_backoff_is_honoured(self):
+        """An exact match must not fall through to backoff-plus-jitter."""
+        mod = load_plugin("ra_equal", f"{self.base}/ra_equal")
+        clock = fast_clock(mod)
+        mod._uniform = lambda _a, _b: 0.25
+        mod.DeepSeekWebSearchProvider().search("q")
+        self.assertEqual(clock["sleeps"], [1.0, 1.0])
+
+    def test_retry_after_is_honoured_when_the_call_can_afford_it(self):
+        """9s is longer than the backoff but still fits the 40s call budget."""
+        Handler.requests.clear()
+        mod = load_plugin("ra_afford", f"{self.base}/ra_long")
+        clock = fast_clock(mod)
+        mod.DeepSeekWebSearchProvider().search("q")
+        self.assertEqual(clock["sleeps"], [9.0])
+        self.assertEqual(len(Handler.requests), 2)
+
+    def test_an_unaffordable_retry_after_stops_the_retries(self):
+        """Waiting less than the server asked would just earn another 429."""
+        mod = load_plugin("ra_huge", f"{self.base}/ra_huge")
+        clock = fast_clock(mod)
+        out = mod.DeepSeekWebSearchProvider().search("q")
+        self.assertEqual(clock["sleeps"], [])
+        self.assertEqual(len(Handler.requests), 1)
+        self.assertIn("HTTP 429", out["error"])
+        self.assertNotIn("retry", out["error"])
+
     def test_retry_stops_when_the_budget_is_spent(self):
+        """A 30s attempt leaves no room for another: the budget bounds the call."""
         mod = load_plugin("budget_slow", f"{self.base}/err")
         clock = fast_clock(mod, advance=30.0)
-        with self.assertLogs(mod.__name__, level="WARNING") as captured:
-            out = mod.DeepSeekWebSearchProvider().search("q")
-        self.assertIn("(after 1 retry)", out["error"])
-        self.assertEqual(len(Handler.requests), 2)
-        self.assertEqual(clock["sleeps"], [1.0])
-        self.assertEqual(
-            [line for line in captured.output if "retry " in line],
-            [f"WARNING:{mod.__name__}:DeepSeek HTTP 500, retry 1/2"],
-        )
+        out = mod.DeepSeekWebSearchProvider().search("q")
+        self.assertEqual(len(Handler.requests), 1)
+        self.assertEqual(clock["sleeps"], [])
+        self.assertIn("HTTP 500", out["error"])
+        self.assertNotIn("retry", out["error"])
+
+    def test_the_budget_covers_the_attempt_not_only_the_wait(self):
+        """18s + 1s wait + a 30s attempt would be 49s, past the 40s budget."""
+        mod = load_plugin("budget_mid", f"{self.base}/err")
+        clock = fast_clock(mod, advance=18.0)
+        mod.DeepSeekWebSearchProvider().search("q")
+        self.assertEqual(len(Handler.requests), 1)
+        self.assertEqual(clock["sleeps"], [])
 
     def test_extract_batch_stops_at_the_shared_deadline(self):
         mod = load_plugin("batch_deadline", f"{self.base}/err")
+        # The deadline is pinned so the skip is caused by it, not by the 40s
+        # budget: two 30s attempts land inside 40s, a third would start past it.
+        mod.__dict__.update(_EXTRACT_DEADLINE_S=40.0)  # dynamic module; untyped on purpose
         clock = fast_clock(mod, advance=30.0)
         urls = [
             "https://example.invalid/1",
@@ -754,18 +793,15 @@ class TestErrorPaths(MockVendor):
         ]
         out = mod.DeepSeekWebSearchProvider().extract(urls)
         self.assertEqual([entry["url"] for entry in out], urls)
-        self.assertEqual(
-            out[0]["error"],
-            "DeepSeek fetch failed: HTTP 500: boom (after 1 retry)",
-        )
+        self.assertEqual(out[0]["error"], "DeepSeek fetch failed: HTTP 500: boom")
         self.assertEqual(out[1]["error"], "DeepSeek fetch failed: HTTP 500: boom")
         self.assertEqual(
             out[2]["error"],
             "DeepSeek fetch failed: batch deadline reached",
         )
         self.assertNotIn("raw_content", out[2])
-        self.assertEqual(len(Handler.requests), 3)
-        self.assertEqual(clock["sleeps"], [1.0])
+        self.assertEqual(len(Handler.requests), 2)
+        self.assertEqual(clock["sleeps"], [])
 
     def test_pages_fetched_before_the_deadline_are_kept(self):
         mod = load_plugin("batch_keep", f"{self.base}/ok")
@@ -790,6 +826,42 @@ class TestErrorPaths(MockVendor):
             self.assertEqual(entry["raw_content"], entry["content"])
         self.assertEqual(out[3].get("error"), "DeepSeek fetch failed: batch deadline reached")
         self.assertEqual(len(Handler.requests), 3)
+
+    def test_the_deadline_and_its_floor_fit_inside_hermes_cap(self):
+        """deadline + the shortest attempt must stay under Hermes' 120s cap."""
+        mod = load_plugin("deadline_cap", None)
+        for deadline in (mod._EXTRACT_DEADLINE_S, mod._EXTRACT_DEADLINE_MAX_S):
+            with self.subTest(deadline=deadline):
+                self.assertLessEqual(deadline + mod._REQUEST_FLOOR_S, 120)
+
+    def test_request_timeout_shrinks_towards_the_deadline(self):
+        """httpx timeouts are per read, so an attempt gets only what is left."""
+        mod = load_plugin("deadline_shrink", f"{self.base}/ok")
+        mod.__dict__.update(_EXTRACT_DEADLINE_S=2.0)  # dynamic module; untyped on purpose
+        clock = fast_clock(mod)
+        seen = []
+
+        def request(url, payload, headers, timeout=None):
+            seen.append(timeout)
+            clock["now"] += 1.0
+            return mod.httpx.Response(200, json={"title": "t", "content": "body"})
+
+        mod._request = request
+        urls = [f"https://example.invalid/{index}" for index in range(3)]
+        out = mod.DeepSeekWebSearchProvider().extract(urls)
+        self.assertEqual(seen, [2.0, 1.0])
+        self.assertNotIn("error", out[0])
+        self.assertNotIn("error", out[1])
+        self.assertIn("batch deadline", out[2]["error"])
+
+    def test_extract_deadline_setting_is_clamped(self):
+        mod = load_plugin("deadline_setting", None)
+        self.assertEqual(mod._extract_deadline(lambda _k: 500), mod._EXTRACT_DEADLINE_MAX_S)
+        self.assertEqual(mod._extract_deadline(lambda _k: -5), mod._EXTRACT_DEADLINE_MIN_S)
+        self.assertEqual(mod._extract_deadline(lambda _k: 42), 42.0)
+        self.assertEqual(mod._extract_deadline(lambda _k: "soon"), mod._EXTRACT_DEADLINE_S)
+        self.assertEqual(mod._extract_deadline(lambda _k: True), mod._EXTRACT_DEADLINE_S)
+        self.assertEqual(mod._extract_deadline(None), mod._EXTRACT_DEADLINE_S)
 
     def test_fast_rate_limits_still_retry_inside_a_batch(self):
         mod = load_plugin("batch_429", f"{self.base}/r429")

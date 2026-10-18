@@ -21,3 +21,7 @@ config_schema:
     type: str
     default: ""
     description: "Optional IP address the Search API localises results to. Empty sends nothing; a value that is not an IP is ignored with a warning rather than sent."
+  extract_deadline:
+    type: int
+    default: 110
+    description: "Seconds one multi-URL web_extract may spend starting requests, clamped to 5-115. Must stay below web.extract_timeout (120 by default); lower it if you lowered that."
