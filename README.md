@@ -20,7 +20,7 @@ Wires DeepSeek's [Search & Fetch APIs](https://api-docs.deepseek.com/guides/sear
 | Registered provider | `deepseek` — the value `web.search_backend` / `web.extract_backend` hold |
 | Kind | `backend` — registers one web provider: no tools, no hooks |
 | Dependencies | none beyond the standard library and the `httpx` Hermes already ships |
-| Tests | 33 stdlib unit + contract tests, 8 Hypothesis property tests — offline, keyless, unbilled |
+| Tests | 51 stdlib unit + contract tests, 8 Hypothesis property tests — offline, keyless, unbilled |
 | Licence | MIT |
 | Affiliation | Community plugin by Jason Swindle. **Not affiliated with DeepSeek.** DeepSeek is a trademark of its owner; this is an independent client. |
 
@@ -95,7 +95,7 @@ hermes plugins disable deepseek-search-fetch
 
 **Billing.** DeepSeek bills **$0.75 per 1,000 successful requests**; failed calls, empty results and timeouts are free. At that rate a 50-call research day is about $0.04, and a thousand calls is 75 cents. Rates change — check DeepSeek's pricing page — and check your own usage with `GET https://api.deepseek.com/user/balance`. **No per-call figure of our own is published here:** the account this plugin was developed against also carries other traffic, so a balance delta cannot be attributed to these calls.
 
-**Limits.** Queries are capped at **128 characters** by the API (longer → HTTP 400, free). `limit` is clamped to **1–50**. **5 requests/second** — a 429 is surfaced as an error rather than retried, and the rescue path covers it. Multi-URL extracts are bounded by Hermes' **120 s** per-provider cap.
+**Limits.** Queries are capped at **128 characters** by the API (longer → HTTP 400, free). `limit` is clamped to **1–50**. Search and Fetch are each **5 requests/second** per account. HTTP 408, 429 and any 5xx are retried up to twice on that same call: the waits are 1s and then 2s, each plus up to 0.25s of jitter, and a further attempt is skipped once the call has spent 40s. A `Retry-After` that is a positive number of seconds replaces that attempt's wait, jitter included, when it is no longer than the wait; an HTTP-date, zero, a negative, or a longer value leaves the scheduled wait in place. A 402 is sent once and tells you to top up the account. Every other 4xx is sent once. Whatever still fails comes back as an error envelope, which Hermes can rescue from the free ring. A multi-URL extract stops starting further requests 85s after it began, so pages already fetched are returned before Hermes' **120 s** cap discards the batch.
 
 **Behaviour worth knowing.**
 
@@ -109,7 +109,7 @@ hermes plugins disable deepseek-search-fetch
 
 ## Security
 
-- The API key is read through Hermes' provider env helper (`get_provider_env`), is **never logged**, and error text is truncated to 300 characters.
+- The API key is read through Hermes' provider env helper (`get_provider_env`), is **never logged**, and the vendor's error text is truncated to 300 characters. The HTTP status, the 402 top-up sentence and a retry suffix are written after that cap.
 - `DEEPSEEK_BASE_URL` exists for tests and is **validated**: only `https://api.deepseek.com` (https) or a loopback host (`127.0.0.1`, `localhost`, `::1`) is accepted. Another host, plaintext to the real host, link-local addresses, userinfo tricks, suffix lookalikes and non-http(s) schemes are refused with a warning, and the default endpoint is used instead. A freely redirectable base URL would hand the bearer key to whoever set the variable, so there is deliberately **no escape hatch** — anyone who can set one variable can set two.
 - No file I/O, no subprocesses, no dynamic imports, no telemetry. Two outbound endpoints, both on `api.deepseek.com`.
 - Like every Hermes web provider it runs inside the plugin host with the agent's environment. Treat installing any plugin as running code with your credentials.
@@ -148,6 +148,8 @@ See [Tests](#tests) — they need no key, no network and no Hermes install.
 | Page content on search results | `DEEPSEEK_SEARCH_NEED_CONTENT` | Off by default. Set to `1` (or `true`/`yes`/`on`) to send `need_content: true` — every hit then carries its page text as clean Markdown. Costs 2–5 KB per result in the tool result and the context window. |
 | Result cap | `_SEARCH_LIMIT_CAP` in `__init__.py` | `50` — DeepSeek's own maximum. |
 | Timeout | `_TIMEOUT` in `__init__.py` | `30.0` s per HTTP call. |
+| Transient retries | `_RETRY_BACKOFF_S`, `_RETRY_JITTER_S`, `_RETRY_BUDGET_S` in `__init__.py` | One further attempt per backoff entry (currently 1s then 2s), plus up to 0.25s of jitter. The call stops retrying once it has spent 40s. A shorter positive `Retry-After`, in seconds, replaces that attempt's wait. |
+| Extract batch deadline | `_EXTRACT_DEADLINE_S` in `__init__.py` | `85` s from the start of one `extract()`. Later URLs are not requested; pages already fetched stay in the list. |
 | Provider name | `provides_web_providers` in `plugin.yaml` | `deepseek`; changing it changes what your config must say. |
 
 ## Tests
@@ -155,10 +157,10 @@ See [Tests](#tests) — they need no key, no network and no Hermes install.
 Offline, keyless and unbilled: a loopback mock server stands in for the vendor, and a small stub lets the plugin import **without a Hermes install**, so the suite runs anywhere.
 
 ```bash
-# Zero-dependency tier (stdlib unittest only) — 34 tests (33 + a skip placeholder)
+# Zero-dependency tier (stdlib unittest only) — 52 tests (51 + a skip placeholder)
 python -m unittest discover -s tests
 
-# Full tier, adding Hypothesis property tests — 41 tests
+# Full tier, adding Hypothesis property tests — 59 tests
 uv venv .venv-dev
 uv pip install --python .venv-dev/bin/python -r requirements-dev.txt
 .venv-dev/bin/python -m unittest discover -s tests
