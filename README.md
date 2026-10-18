@@ -105,7 +105,7 @@ A multi-URL extract stops starting requests **110 s** after it began, and each r
 - **Fetched Markdown arrives backslash-escaped, and this plugin reverses it.** `/v1/tools/fetch` escapes every ASCII punctuation character in the page text — a page's `# Heading` comes back as `\# Heading`, links as `\[text\]\(https\:\/\/…\)`, table pipes as `\|` — so the text renders as punctuation rather than structure. `extract()` unescapes backslash-plus-punctuation in **both** `content` and `raw_content`. Both, not one: Hermes prefers `raw_content` when it derives the model-visible content and when it writes its extract cache, so a half-fix would keep serving escaped text out of the cache. Letter escapes survive untouched (`\n`, `\d+`, `C:\path`), and a page whose own source deliberately escaped punctuation will have that escape removed too — the vendor's escaping is uniform, so no rule can tell the two apart.
 - **`ori_question` is the one documented Search field still not forwarded.** It is "the user's original question that triggered the search", and Hermes' provider interface hands `search()` only `(query, limit)`: the question never reaches the plugin, so echoing `query` into `ori_question` would add nothing. `localization` is now forwarded from the plugin's settings (see [Settings](#settings)); `need_content` likewise.
 - Empty search results are success with an empty list, not an error.
-- **Search returns metadata only unless you ask for content.** `need_content` is a per-request option on the Search API, and this plugin sends it only when the `need_content` setting is on (or, unset, when `DEEPSEEK_SEARCH_NEED_CONTENT` is truthy) — one search then carries the pages' text, where getting the same text otherwise costs one Fetch call per URL. It is off by default because that text is 2–5 KB per result, and Hermes' own `web_search` contract is metadata-only ("use `web_extract` for page content"). When it is on, the search endpoint's `content` needs no unescaping — that escaping is a fetch-endpoint behaviour.
+- **Search returns metadata only unless you ask for content.** `need_content` is a per-request option on the Search API, and this plugin sends it only when the `need_content` setting is on (or, unset, when `DEEPSEEK_SEARCH_NEED_CONTENT` is truthy) — one search then carries the pages' text, where getting the same text otherwise costs one Fetch call per URL. It is off by default because that text is large — **a live run on 2026-10-18 returned 20,176 characters for a single hit** — and Hermes' own `web_search` contract is metadata-only ("use `web_extract` for page content"), which budgets and truncates what `web_search` does not. When it is on, the search endpoint's `content` needs no unescaping — that escaping is a fetch-endpoint behaviour.
 - `extract()` returns a **bare list** of entries. Parts of the Hermes docs show a `{"success": …, "data": […]}` envelope instead; the bundled providers return a bare list and the dispatcher consumes it that way, so this matches bundled behaviour deliberately — pinned by a test.
 - A rescued **search** carries `rescued_from` / `backend_error`; a rescued **extract** does not, because Hermes drops entry metadata during serialization. Judge extract provenance from the log line (`Web extract via …`).
 
@@ -148,7 +148,7 @@ The plugin declares its own settings, so they appear in Hermes' plugin form — 
 
 | Setting | Type | Default | Effect |
 |---|---|---|---|
-| `need_content` | boolean | off | Sends `need_content: true`: every search hit carries its page text as clean Markdown. Costs 2–5 KB per result. |
+| `need_content` | boolean | off | Sends `need_content: true`: every search hit carries its page text as clean Markdown. Costs kilobytes per result — **a live run returned 20 KB for a single hit** — so a `limit` of 5 can reach tens of KB of context. |
 | `localization` | string | empty | An IP address the Search API localises results to. Empty sends nothing; a value that is not an IP is ignored with a warning rather than sent and billed as a 400. |
 | `extract_deadline` | integer | 110 | Seconds one multi-URL `extract()` may spend starting requests. Clamped to 5–115. Lower it to match a lowered `web.extract_timeout`; the plugin cannot read that setting. |
 
@@ -193,6 +193,18 @@ Offline, keyless and unbilled; run it by hand before a release:
 python dsweb-integration.py --hermes-home /tmp/dsw-it --hermes /path/to/hermes \
   --install <40-char-sha>
 ```
+
+Neither of those touches the vendor, so neither can show that DeepSeek accepts what we send.
+`dsweb-live-accept.py` is the one run that can, and it **spends money** — about $0.004 for its five
+calls at list price. Run it once before a release, never in CI:
+
+```bash
+python dsweb-live-accept.py --spend
+```
+
+It proves a live search returns hits with the vendor's signals, that `need_content` really returns
+page text, that `localization` is accepted rather than rejected as an unknown field, that fetched
+Markdown comes back unescaped, and that a 129-character query is refused with HTTP 400.
 
 The property tier generates arbitrary Unicode — including unpaired surrogates, which Hypothesis' default `st.text()` alphabet deliberately excludes — and asserts the invariant that made it necessary: whatever a caller passes, a UTF-8-encodable value reaches the wire. Point `DEEPSEEK_PLUGIN_PATH` at another copy of the plugin to test that copy; the falsification procedure and the invariants that must not break live in [AGENTS.md](AGENTS.md).
 

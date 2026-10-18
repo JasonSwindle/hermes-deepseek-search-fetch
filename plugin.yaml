@@ -16,7 +16,7 @@ config_schema:
   need_content:
     type: bool
     default: false
-    description: "Send need_content so each search hit carries its page text as clean Markdown. Off by default: 2–5 KB per result. A query already in Hermes' 20-minute search cache keeps its cached shape until the cache expires."
+    description: "Send need_content so each search hit carries its page text as clean Markdown. Off by default: a live run returned 20 KB for one hit, so a result set can cost tens of KB of context. A query already in Hermes' 20-minute search cache keeps its cached shape until the cache expires."
   localization:
     type: str
     default: ""

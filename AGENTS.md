@@ -35,6 +35,9 @@ rule 9). That is expected and only a warning: the script *is* the integration ti
 drive the real dispatcher, while the plugin's own runtime imports stay on the documented ABC. Keep
 the import out of `__init__.py`.
 
+And once, before a release pin — the only run that touches the vendor, and the only one that costs
+money (~$0.004): `python dsweb-live-accept.py --spend`. It needs a real key; never wire it into CI.
+
 Falsification check (do this when you touch the sanitizer or the guard): make a copy
 of the plugin with `_utf8_safe` neutered to `return text`, run the suite with
 `DEEPSEEK_PLUGIN_PATH=<copy>`, and confirm it goes **red**. A suite that stays green

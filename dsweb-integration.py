@@ -14,8 +14,7 @@ script does, against a real Hermes install:
      search memo and the extract wrapper are all in the path.
 
 Offline, keyless and unbilled: the key is a placeholder and every request lands on the mock. Nothing
-here touches the real API — a live-acceptance run against api.deepseek.com is a separate, manual act
-that spends money and needs a real key.
+here touches the real API — that is `dsweb-live-accept.py`, a separate manual run that spends money.
 
     python dsweb-integration.py --hermes-home /tmp/dsw-it --install <40-char-sha>
     python dsweb-integration.py --hermes-home /tmp/dsw-it          # re-run against what is installed
