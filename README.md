@@ -103,7 +103,7 @@ hermes plugins disable deepseek-search-fetch
 - **Fetched Markdown arrives backslash-escaped, and this plugin reverses it.** `/v1/tools/fetch` escapes every ASCII punctuation character in the page text — a page's `# Heading` comes back as `\# Heading`, links as `\[text\]\(https\:\/\/…\)`, table pipes as `\|` — so the text renders as punctuation rather than structure. `extract()` unescapes backslash-plus-punctuation in **both** `content` and `raw_content`. Both, not one: Hermes prefers `raw_content` when it derives the model-visible content and when it writes its extract cache, so a half-fix would keep serving escaped text out of the cache. Letter escapes survive untouched (`\n`, `\d+`, `C:\path`), and a page whose own source deliberately escaped punctuation will have that escape removed too — the vendor's escaping is uniform, so no rule can tell the two apart.
 - **Two documented request fields are deliberately not forwarded.** `ori_question` ("the user's original question") and `localization` (an IP used to localise results) exist on the Search API and are accepted by it, but Hermes' provider interface hands `search()` only `(query, limit)`: the user's question never reaches the plugin, so echoing `query` into `ori_question` would add nothing, and there is no config surface for an IP. Tracked upstream, not worked around. `need_content` is the third: per-request on the API, but toggleable here only process-wide via `DEEPSEEK_SEARCH_NEED_CONTENT`.
 - Empty search results are success with an empty list, not an error.
-- **Search returns metadata only unless you ask for content.** `need_content` is a per-request option on the Search API, and this plugin sends it only when `DEEPSEEK_SEARCH_NEED_CONTENT` is truthy — one search then carries the pages' text, where getting the same text otherwise costs one Fetch call per URL. It is off by default because that text is 2–5 KB per result, and Hermes' own `web_search` contract is metadata-only ("use `web_extract` for page content"). When it is on, the search endpoint's `content` needs no unescaping — that escaping is a fetch-endpoint behaviour.
+- **Search returns metadata only unless you ask for content.** `need_content` is a per-request option on the Search API, and this plugin sends it only when the `need_content` setting is on (or, unset, when `DEEPSEEK_SEARCH_NEED_CONTENT` is truthy) — one search then carries the pages' text, where getting the same text otherwise costs one Fetch call per URL. It is off by default because that text is 2–5 KB per result, and Hermes' own `web_search` contract is metadata-only ("use `web_extract` for page content"). When it is on, the search endpoint's `content` needs no unescaping — that escaping is a fetch-endpoint behaviour.
 - `extract()` returns a **bare list** of entries. Parts of the Hermes docs show a `{"success": …, "data": […]}` envelope instead; the bundled providers return a bare list and the dispatcher consumes it that way, so this matches bundled behaviour deliberately — pinned by a test.
 - A rescued **search** carries `rescued_from` / `backend_error`; a rescued **extract** does not, because Hermes drops entry metadata during serialization. Judge extract provenance from the log line (`Web extract via …`).
 
@@ -140,12 +140,24 @@ There are no platform-specific imports, and CI exercises the suite on Linux, mac
 **How do I run the tests?**
 See [Tests](#tests) — they need no key, no network and no Hermes install.
 
+## Settings
+
+The plugin declares its own settings, so they appear in Hermes' plugin form — Desktop → Settings → Plugins → DeepSeek Search & Fetch, or `hermes plugins manage settings` in the terminal — rather than being hand-written into `config.yaml`.
+
+| Setting | Type | Default | Effect |
+|---|---|---|---|
+| `need_content` | boolean | off | Sends `need_content: true`: every search hit carries its page text as clean Markdown. Costs 2–5 KB per result. |
+
+A setting is read on every search, and Hermes' config cache is keyed on the config file's signature, so a change lands on the **next search** — no session restart. One caveat: Hermes caches successful search responses for `web.cache_ttl_minutes` (20 by default) against the query, so a query already answered before the change keeps its old shape until that entry expires.
+
+Settings live under `plugins.entries.<id>.settings.<key>`, and `<id>` depends on how the plugin was installed — a catalog or git install lands as `deepseek-search-fetch`, a manual clone under `plugins/web/` as `web/deepseek-search-fetch`. Use the form, which resolves the id; `hermes plugins list` shows it if you must set a value by path.
+
 ## Tune it
 
 | What | Where | Notes |
 |---|---|---|
 | Endpoint | `DEEPSEEK_BASE_URL` | Tests only; validated as described above. |
-| Page content on search results | `DEEPSEEK_SEARCH_NEED_CONTENT` | Off by default. Set to `1` (or `true`/`yes`/`on`) to send `need_content: true` — every hit then carries its page text as clean Markdown. Costs 2–5 KB per result in the tool result and the context window. |
+| Page content on search results | `need_content` setting, or `DEEPSEEK_SEARCH_NEED_CONTENT` | Off by default. The setting wins when it is set; the environment variable is the fallback for hosts without a settings surface, accepting `1` (or `true`/`yes`/`on`). Either one sends `need_content: true` — every hit then carries its page text as clean Markdown, at 2–5 KB per result in the tool result and the context window. |
 | Result cap | `_SEARCH_LIMIT_CAP` in `__init__.py` | `50` — DeepSeek's own maximum. |
 | Timeout | `_TIMEOUT` in `__init__.py` | `30.0` s per HTTP call. |
 | Transient retries | `_RETRY_BACKOFF_S`, `_RETRY_JITTER_S`, `_RETRY_BUDGET_S` in `__init__.py` | One further attempt per backoff entry (currently 1s then 2s), plus up to 0.25s of jitter. The call stops retrying once it has spent 40s. A shorter positive `Retry-After`, in seconds, replaces that attempt's wait. |

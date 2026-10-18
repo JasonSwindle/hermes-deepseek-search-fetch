@@ -30,9 +30,12 @@ against a broken copy proves nothing. Same for the unescaper: neuter
 
 - `search()` returns `{"success": bool, "data": {"web": [{title, url, description, position,
   rerank_score, authority, date, site_name, site_icon}]}}`, and posts `need_content: true` only when
-  `DEEPSEEK_SEARCH_NEED_CONTENT` is truthy (the default stays metadata-only, matching Hermes'
-  `web_search` contract). With the opt-in on, each hit also carries `content` — the page text,
-  which the search endpoint returns as clean Markdown.
+  the `need_content` setting is on — falling back to `DEEPSEEK_SEARCH_NEED_CONTENT` when the setting
+  is unset (a host with no settings surface). Only a real boolean in the setting counts: a string
+  `"true"` in a hand-edited config is not consent. A failing settings read is `.off`, never an
+  exception out of `search()`. The reader is called per search, so a change lands on the next call
+  without a restart. With the opt-in on, each hit also carries `content` — the page text, which the
+  search endpoint returns as clean Markdown.
 - `extract()` returns a **bare list** of entry dicts (`url`, `title`, `content`,
   `raw_content`, `metadata`, or `error` per entry) — *not* the
   `{"success": …, "data": […]}` envelope the Hermes docs show elsewhere. The bundled

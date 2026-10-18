@@ -400,6 +400,58 @@ class TestSearchContract(MockVendor):
                 self.assertFalse(mod._need_content_enabled())
         os.environ.pop("DEEPSEEK_SEARCH_NEED_CONTENT", None)
 
+    def test_need_content_setting_sends_the_flag(self):
+        """A ticked setting is what puts need_content on the wire."""
+        os.environ.pop("DEEPSEEK_SEARCH_NEED_CONTENT", None)
+        mod = load_plugin("s_nc_setting_on", f"{self.base}/body_content")
+        p = mod.DeepSeekWebSearchProvider(lambda key: True)
+        p.search("q", limit=2)
+        self.assertEqual(self.last_body(),
+                         {"query": "q", "count": 2, "need_content": True})
+
+    def test_need_content_setting_wins_over_the_env_var(self):
+        """An ambient variable must not override a choice made in the UI."""
+        os.environ["DEEPSEEK_SEARCH_NEED_CONTENT"] = "1"
+        try:
+            mod = load_plugin("s_nc_setting_off", f"{self.base}/body_content")
+            p = mod.DeepSeekWebSearchProvider(lambda key: False)
+            p.search("q", limit=2)
+            self.assertEqual(self.last_body(), {"query": "q", "count": 2})
+        finally:
+            os.environ.pop("DEEPSEEK_SEARCH_NEED_CONTENT", None)
+
+    def test_unset_setting_falls_back_to_the_env_var(self):
+        """None means "not set", not "off": the environment still works."""
+        os.environ["DEEPSEEK_SEARCH_NEED_CONTENT"] = "1"
+        try:
+            mod = load_plugin("s_nc_setting_unset", f"{self.base}/body_content")
+            p = mod.DeepSeekWebSearchProvider(lambda key: None)
+            p.search("q", limit=2)
+            self.assertEqual(self.last_body(),
+                             {"query": "q", "count": 2, "need_content": True})
+        finally:
+            os.environ.pop("DEEPSEEK_SEARCH_NEED_CONTENT", None)
+
+    def test_a_non_boolean_setting_does_not_enable_content(self):
+        """"true" in a hand-edited config is not consent; a bool or nothing."""
+        os.environ.pop("DEEPSEEK_SEARCH_NEED_CONTENT", None)
+        mod = load_plugin("s_nc_setting_str", f"{self.base}/body_content")
+        p = mod.DeepSeekWebSearchProvider(lambda key: "true")
+        p.search("q", limit=2)
+        self.assertEqual(self.last_body(), {"query": "q", "count": 2})
+
+    def test_a_failing_settings_reader_does_not_break_search(self):
+        """A settings read is a preference, never a capability gate."""
+        os.environ.pop("DEEPSEEK_SEARCH_NEED_CONTENT", None)
+        mod = load_plugin("s_nc_setting_raises", f"{self.base}/body_content")
+
+        def boom(key):
+            raise RuntimeError("config unavailable")
+
+        out = mod.DeepSeekWebSearchProvider(boom).search("q", limit=2)
+        self.assertTrue(out["success"])
+        self.assertEqual(self.last_body(), {"query": "q", "count": 2})
+
     def test_query_is_utf8_sanitised_before_send(self):
         p = provider("s_sur", f"{self.base}/ok")
         p.search("lone \ud800 query")

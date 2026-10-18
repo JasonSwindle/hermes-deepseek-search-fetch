@@ -110,23 +110,39 @@ def _unescape_markdown(text: str) -> str:
 # Search returns metadata only unless the API is asked for page content. Setting
 # `need_content` makes every result carry its page text as clean Markdown — and
 # costs 2-5 KB per result, straight into the tool result and the context window.
-# So it is opt-in: DEEPSEEK_SEARCH_NEED_CONTENT=1 (or true/yes/on).
+# So it is opt-in, from the plugin's own setting (Desktop plugin form, or
+# `hermes plugins manage settings`), or — for hosts with no settings surface —
+# from DEEPSEEK_SEARCH_NEED_CONTENT=1 (or true/yes/on).
 _NEED_CONTENT_ENV = "DEEPSEEK_SEARCH_NEED_CONTENT"
+_NEED_CONTENT_SETTING = "need_content"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
-def _need_content_enabled() -> bool:
-    """True when the operator opted into page content on search results.
-
-    Read through get_provider_env so a value set in Hermes' config layer works
-    like one exported in the environment. Any failure to read the flag counts as
-    "off" — a capability must never fail over a preference.
-    """
+def _env_need_content() -> bool:
+    """The environment fallback: True when the operator opted in there."""
     try:
         raw = get_provider_env(_NEED_CONTENT_ENV) or ""
     except Exception:  # never raise out of a capability
         return False
     return raw.strip().lower() in _TRUTHY
+
+
+def _need_content_enabled(get_setting=None) -> bool:
+    """True when page content on search results was asked for.
+
+    The plugin setting wins when it holds a boolean: a box ticked in the UI is
+    a deliberate choice, and an ambient environment variable must not override
+    it. An unset setting falls through to the environment. Any failure to read
+    either counts as "off" — a capability must never fail over a preference.
+    """
+    if get_setting is not None:
+        try:
+            value = get_setting(_NEED_CONTENT_SETTING)
+        except Exception:  # never raise out of a capability
+            return _env_need_content()
+        if isinstance(value, bool):
+            return value
+    return _env_need_content()
 
 
 def _missing_key_error() -> str:
@@ -240,6 +256,11 @@ def _status_error(resp: httpx.Response, retries: int) -> RuntimeError:
 class DeepSeekWebSearchProvider(WebSearchProvider):
     """DeepSeek Search & Fetch APIs as a Hermes web provider."""
 
+    def __init__(self, get_setting=None) -> None:
+        # Hermes passes a settings reader in register(); the tests construct the
+        # provider directly, and a host without a settings surface leaves it None.
+        self._get_setting = get_setting
+
     @property
     def name(self) -> str:
         return "deepseek"
@@ -326,7 +347,7 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
         try:
             query = _utf8_safe(query) if isinstance(query, str) else query
             count = min(max(int(limit), 1), _SEARCH_LIMIT_CAP)
-            want_content = _need_content_enabled()
+            want_content = _need_content_enabled(self._get_setting)
             payload: dict[str, Any] = {"query": query, "count": count}
             if want_content:
                 payload["need_content"] = True
@@ -410,4 +431,11 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
 
 
 def register(ctx) -> None:
-    ctx.register_web_search_provider(DeepSeekWebSearchProvider())
+    # The settings surface (plugins.entries.<id>.settings) is what makes
+    # `need_content` live: the reader is called per search, and Hermes' config
+    # cache is file-signature keyed, so a settings change lands on the next
+    # search without restarting the session. On a host that predates it there is
+    # no get_config, and the provider falls back to the environment variable.
+    reader = getattr(ctx, "get_config", None)
+    get_setting = (lambda key: reader(key, default=None)) if reader is not None else None
+    ctx.register_web_search_provider(DeepSeekWebSearchProvider(get_setting))
