@@ -20,6 +20,24 @@ Run both before declaring any change done. The suite is offline by construction 
 loopback mock server stands in for the vendor and `DEEPSEEK_BASE_URL` is what points
 at it. Never aim the tests at the real API; nothing in `tests/` should ever need a key.
 
+Then the tier that actually proves the plugin fits Hermes (neither unittest tier can):
+
+```bash
+python dsweb-integration.py --hermes-home /tmp/dsw-it --hermes /path/to/hermes --install <sha>
+```
+
+It installs the plugin into a throwaway HERMES_HOME through `hermes plugins install --ref <sha>`,
+points it at a loopback mock, and drives the real dispatcher: settings at call time, retry counts,
+extract unescaping, per-URL errors, the search-memo caveat. Run it before every release pin.
+
+`hermes plugins validate` warns "private core imports" on that script (`tools.web_tools` — catalog
+rule 9). That is expected and only a warning: the script *is* the integration tier, so it has to
+drive the real dispatcher, while the plugin's own runtime imports stay on the documented ABC. Keep
+the import out of `__init__.py`.
+
+And once, before a release pin — the only run that touches the vendor, and the only one that costs
+money (~$0.004): `python dsweb-live-accept.py --spend`. It needs a real key; never wire it into CI.
+
 Falsification check (do this when you touch the sanitizer or the guard): make a copy
 of the plugin with `_utf8_safe` neutered to `return text`, run the suite with
 `DEEPSEEK_PLUGIN_PATH=<copy>`, and confirm it goes **red**. A suite that stays green
@@ -30,9 +48,12 @@ against a broken copy proves nothing. Same for the unescaper: neuter
 
 - `search()` returns `{"success": bool, "data": {"web": [{title, url, description, position,
   rerank_score, authority, date, site_name, site_icon}]}}`, and posts `need_content: true` only when
-  `DEEPSEEK_SEARCH_NEED_CONTENT` is truthy (the default stays metadata-only, matching Hermes'
-  `web_search` contract). With the opt-in on, each hit also carries `content` — the page text,
-  which the search endpoint returns as clean Markdown.
+  the `need_content` setting is on — falling back to `DEEPSEEK_SEARCH_NEED_CONTENT` when the setting
+  is unset (a host with no settings surface). Only a real boolean in the setting counts: a string
+  `"true"` in a hand-edited config is not consent. A failing settings read is `.off`, never an
+  exception out of `search()`. The reader is called per search, so a change lands on the next call
+  without a restart. With the opt-in on, each hit also carries `content` — the page text, which the
+  search endpoint returns as clean Markdown.
 - `extract()` returns a **bare list** of entry dicts (`url`, `title`, `content`,
   `raw_content`, `metadata`, or `error` per entry) — *not* the
   `{"success": …, "data": […]}` envelope the Hermes docs show elsewhere. The bundled
@@ -42,6 +63,14 @@ against a broken copy proves nothing. Same for the unescaper: neuter
   derives the model-visible content and when it writes its extract cache — so unescaping
   only one field reintroduces the escaping in every cached and budgeted result.
 - `is_available()` **must not** touch the network; it runs on every `hermes tools` paint.
+- `need_content` and `localization` are read from the plugin's own settings on every search
+  (`ctx.get_config`, wired in `register()`); a host without that surface leaves the reader `None`
+  and the code falls back to `DEEPSEEK_SEARCH_NEED_CONTENT` for the first and to "not set" for the
+  second. A failing read is "off", never an exception out of `search()`. `localization` is sent only
+  when `ipaddress.ip_address` accepts it — the API takes an IP, so anything else would be a billed 400.
+- `hermes plugins validate .` on a working tree that carries `.venv-dev/` fails its security scan on
+  the virtualenv (`.so` files, symlinks, trio's sockets). That is the dev tree, not the plugin:
+  validate a clean export (`git archive HEAD | tar -x -C <dir>`) or the catalog install path.
 - Every outgoing query and URL is UTF-8-safe: unpaired surrogates become U+FFFD.
   httpx raises while *encoding* the body otherwise, so the call dies before it is sent.
 - `DEEPSEEK_BASE_URL` is accepted only as `https://api.deepseek.com` (https) or a
@@ -50,12 +79,20 @@ against a broken copy proves nothing. Same for the unescaper: neuter
 - No `limit` outside 1–50 may reach the API, and the key must never be logged.
 - Retries are only for HTTP 408, 429 and 5xx, at most once per entry of
   `_RETRY_BACKOFF_S`. A 200 whose body is not JSON still carries that retry count.
-  A positive `Retry-After` in seconds replaces an attempt's wait when it is no
-  longer than that attempt's backoff. Retry log lines carry the status and the
-  attempt number, and they follow the key rule above.
-- A multi-URL `extract()` stops starting requests `_EXTRACT_DEADLINE_S` after it
-  began, so pages already fetched survive Hermes' extract timeout: they stay in
-  the returned list and only the skipped URLs carry an error.
+  `_RETRY_BUDGET_S` bounds the **call**, not just the wait: a retry is scheduled
+  only when `elapsed + delay + _TIMEOUT` still fits, because an attempt can spend
+  the whole 30s timeout. A `Retry-After` in seconds replaces that attempt's wait
+  when the budget can afford it, and ends the retries when it cannot — retrying
+  sooner than the server asked just earns another 429. Retry log lines carry the
+  status and the attempt number, and they follow the key rule above.
+- An `extract()` attempt is given `min(_TIMEOUT, deadline - now)` as its httpx
+  timeout, because httpx timeouts are per connect/read and **not** wall-clock: a
+  body that trickles in fast enough to reset the read timer outlives 30s, and the
+  batch then overruns Hermes' 120s cap, which discards every page fetched. Worst
+  case is `extract_deadline + _REQUEST_FLOOR_S`; `_EXTRACT_DEADLINE_MAX_S +
+  _REQUEST_FLOOR_S <= 120` is pinned by a test. Lowering `web.extract_timeout`
+  below that gap means lowering the `extract_deadline` setting too — the plugin
+  cannot read Hermes' web config, which is not plugin-scoped.
 
 ## Do not
 

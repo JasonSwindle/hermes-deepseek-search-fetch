@@ -11,6 +11,7 @@ and httpx (both guaranteed present — every sibling provider uses httpx).
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -64,19 +65,34 @@ _SEARCH_LIMIT_CAP = 50  # DeepSeek count: 1-50
 # once. The wait is per call. Search and Fetch have separate 5 QPS account
 # caps, Fetch adds a per-domain cap, and other processes on the account are
 # invisible here, so a queue in this process would not be the account's limit.
-# Two quick retries clear a one-second QPS bucket. The 40s budget leaves a slow
-# 5xx (each attempt may use the whole 30s timeout) room for one retry. Extract
-# walks URLs one by one, and Hermes abandons the whole batch at 120s — pages
-# already fetched included — so the batch itself stops starting requests at 85s.
-# One attempt still in flight can use the 30s timeout and the call returns
-# inside the default cap.
+# Two quick retries clear a one-second QPS bucket.
+#
+# The 40s budget bounds the CALL, not just the wait: a retry is only scheduled
+# when the attempt it schedules still fits inside the budget, so a slow call
+# cannot spend a third 30s attempt past it.
+#
+# Extract walks URLs one by one, and Hermes abandons the whole batch at 120s —
+# pages already fetched included. Two things keep the batch inside that cap.
+# httpx timeouts are per connect/read, NOT wall-clock: a body that trickles in
+# fast enough to reset the read timer outlives _TIMEOUT, so a deadline that
+# gated only the start of an attempt would bound nothing. Each attempt gets
+# only the time the deadline has left, capped at _TIMEOUT, and the batch stops
+# starting requests at the deadline — worst case deadline + _REQUEST_FLOOR_S.
 # The limit is the length of the backoff list, so adding a wait cannot
 # index off the end of the tuple.
 _RETRY_BACKOFF_S = (1.0, 2.0)
 _RETRY_LIMIT = len(_RETRY_BACKOFF_S)
 _RETRY_JITTER_S = 0.25
 _RETRY_BUDGET_S = 40.0
-_EXTRACT_DEADLINE_S = 85.0
+_REQUEST_FLOOR_S = 0.5
+# 110 plus the 0.5s floor sits inside Hermes' default 120s cap with room for the
+# thread hop, and leaves the rest of the window to pages that would otherwise
+# never be started. Lower it when web.extract_timeout is lowered — the plugin
+# cannot read that setting, so the two numbers have to be kept in step by hand.
+_EXTRACT_DEADLINE_S = 110.0
+_EXTRACT_DEADLINE_SETTING = "extract_deadline"
+_EXTRACT_DEADLINE_MIN_S = 5.0
+_EXTRACT_DEADLINE_MAX_S = 115.0
 _BATCH_DEADLINE = "batch deadline reached"
 _DETAIL_CAP = 300
 _TOP_UP = "Top up the DeepSeek account before retrying."
@@ -110,23 +126,85 @@ def _unescape_markdown(text: str) -> str:
 # Search returns metadata only unless the API is asked for page content. Setting
 # `need_content` makes every result carry its page text as clean Markdown — and
 # costs 2-5 KB per result, straight into the tool result and the context window.
-# So it is opt-in: DEEPSEEK_SEARCH_NEED_CONTENT=1 (or true/yes/on).
+# So it is opt-in, from the plugin's own setting (Desktop plugin form, or
+# `hermes plugins manage settings`), or — for hosts with no settings surface —
+# from DEEPSEEK_SEARCH_NEED_CONTENT=1 (or true/yes/on).
 _NEED_CONTENT_ENV = "DEEPSEEK_SEARCH_NEED_CONTENT"
+_NEED_CONTENT_SETTING = "need_content"
+_LOCALIZATION_SETTING = "localization"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
-def _need_content_enabled() -> bool:
-    """True when the operator opted into page content on search results.
-
-    Read through get_provider_env so a value set in Hermes' config layer works
-    like one exported in the environment. Any failure to read the flag counts as
-    "off" — a capability must never fail over a preference.
-    """
+def _env_need_content() -> bool:
+    """The environment fallback: True when the operator opted in there."""
     try:
         raw = get_provider_env(_NEED_CONTENT_ENV) or ""
     except Exception:  # never raise out of a capability
         return False
     return raw.strip().lower() in _TRUTHY
+
+
+def _need_content_enabled(get_setting=None) -> bool:
+    """True when page content on search results was asked for.
+
+    The plugin setting wins when it holds a boolean: a box ticked in the UI is
+    a deliberate choice, and an ambient environment variable must not override
+    it. An unset setting falls through to the environment. Any failure to read
+    either counts as "off" — a capability must never fail over a preference.
+    """
+    if get_setting is not None:
+        try:
+            value = get_setting(_NEED_CONTENT_SETTING)
+        except Exception:  # never raise out of a capability
+            return _env_need_content()
+        if isinstance(value, bool):
+            return value
+    return _env_need_content()
+
+
+def _localization(get_setting=None) -> str:
+    """The Search API's `localization` IP, or "" when it is not usable.
+
+    The API takes an IP address for this field, so anything else is refused
+    here with a warning instead of being sent and billed as a 400. A setting
+    that is not a string is ignored the same way; an unavailable settings
+    surface is simply "not set".
+    """
+    if get_setting is None:
+        return ""
+    try:
+        value = get_setting(_LOCALIZATION_SETTING)
+    except Exception:  # never raise out of a capability
+        return ""
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if not value:
+        return ""
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        logger.warning("Ignoring %s setting %r: not an IP address", _LOCALIZATION_SETTING, value)
+        return ""
+    return value
+
+
+def _extract_deadline(get_setting=None) -> float:
+    """Seconds one ``extract()`` may spend starting requests.
+
+    A setting exists because the number has to be kept below Hermes'
+    ``web.extract_timeout`` (120 by default) and the plugin cannot read that
+    setting — it is not plugin-scoped. Anything unusable falls back to the
+    built-in value, clamped, so a bad setting can never uncap the batch.
+    """
+    if get_setting is not None:
+        try:
+            value = get_setting(_EXTRACT_DEADLINE_SETTING)
+        except Exception:  # never raise out of a capability
+            value = None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return min(max(float(value), _EXTRACT_DEADLINE_MIN_S), _EXTRACT_DEADLINE_MAX_S)
+    return _EXTRACT_DEADLINE_S
 
 
 def _missing_key_error() -> str:
@@ -152,8 +230,9 @@ def _retry_suffix(retries: int) -> str:
 def _retry_after_seconds(value: str | None) -> float | None:
     """The header's whole value, when it is a positive number of seconds.
 
-    HTTP-dates, zero, negatives and non-numeric text are ignored. The caller
-    also ignores a value longer than this attempt's own backoff.
+    HTTP-dates, zero, negatives, infinities and non-numeric text are ignored.
+    The caller honours any affordable value and stops retrying when the wait it
+    asks for does not fit inside the call's budget.
     """
     if value is None:
         return None
@@ -166,18 +245,9 @@ def _retry_after_seconds(value: str | None) -> float | None:
     return seconds
 
 
-def _retry_delay(resp: httpx.Response, retries: int) -> float:
-    """Backoff for this attempt, or Retry-After when it is a shorter wait.
-
-    Retry-After replaces the whole delay, jitter included. A value longer than
-    this attempt's backoff, or one this function cannot parse, leaves the
-    backoff and its jitter in place.
-    """
-    backoff = _RETRY_BACKOFF_S[retries]
-    seconds = _retry_after_seconds(resp.headers.get("Retry-After"))
-    if seconds is not None and seconds <= backoff:
-        return seconds
-    return backoff + _uniform(0.0, _RETRY_JITTER_S)
+def _backoff_delay(retries: int) -> float:
+    """The scheduled wait before retry ``retries + 1``, jitter included."""
+    return _RETRY_BACKOFF_S[retries] + _uniform(0.0, _RETRY_JITTER_S)
 
 
 def _error_message(raw: str) -> str | None:
@@ -219,8 +289,13 @@ def _uniform(low: float, high: float) -> float:
     return random.uniform(low, high)
 
 
-def _request(url: str, payload: dict[str, Any], headers: dict[str, str]) -> httpx.Response:
-    return httpx.post(url, json=payload, headers=headers, timeout=_TIMEOUT)
+def _request(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout: float = _TIMEOUT,
+) -> httpx.Response:
+    return httpx.post(url, json=payload, headers=headers, timeout=timeout)
 
 
 def _status_error(resp: httpx.Response, retries: int) -> RuntimeError:
@@ -239,6 +314,11 @@ def _status_error(resp: httpx.Response, retries: int) -> RuntimeError:
 
 class DeepSeekWebSearchProvider(WebSearchProvider):
     """DeepSeek Search & Fetch APIs as a Hermes web provider."""
+
+    def __init__(self, get_setting=None) -> None:
+        # Hermes passes a settings reader in register(); the tests construct the
+        # provider directly, and a host without a settings surface leaves it None.
+        self._get_setting = get_setting
 
     @property
     def name(self) -> str:
@@ -273,6 +353,12 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
                 if held is None:
                     raise RuntimeError(_BATCH_DEADLINE)
                 raise _status_error(held, retries)
+            attempt_timeout = _TIMEOUT
+            if deadline is not None:
+                # httpx timeouts are per connect/read, not wall-clock: give the
+                # attempt only what the deadline has left, or a body that trickles
+                # in fast enough to reset the read timer outlives both.
+                attempt_timeout = min(_TIMEOUT, max(_REQUEST_FLOOR_S, deadline - _monotonic()))
             try:
                 resp = _request(
                     url,
@@ -281,6 +367,7 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
                         "Authorization": f"Bearer {get_provider_env('DEEPSEEK_API_KEY')}",
                         "Content-Type": "application/json",
                     },
+                    timeout=attempt_timeout,
                 )
             except httpx.TransportError as exc:
                 # A dropped connection is not one of the documented statuses.
@@ -308,8 +395,14 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
                 or elapsed >= _RETRY_BUDGET_S
             ):
                 raise _status_error(resp, retries)
-            delay = _retry_delay(resp, retries)
-            past_budget = elapsed + delay >= _RETRY_BUDGET_S
+            # Retry-After is an instruction, not a hint: honour it when this call
+            # can afford the wait, and stop retrying when it cannot. Waiting less
+            # than the server asked would just earn another 429 — sooner.
+            retry_after = _retry_after_seconds(resp.headers.get("Retry-After"))
+            delay = retry_after if retry_after is not None else _backoff_delay(retries)
+            # The budget bounds the call: only schedule an attempt that still
+            # fits inside it, or a slow 5xx spends 30s past a 40s budget.
+            past_budget = elapsed + delay + _TIMEOUT > _RETRY_BUDGET_S
             past_deadline = deadline is not None and now + delay >= deadline
             if past_budget or past_deadline:
                 raise _status_error(resp, retries)
@@ -326,10 +419,13 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
         try:
             query = _utf8_safe(query) if isinstance(query, str) else query
             count = min(max(int(limit), 1), _SEARCH_LIMIT_CAP)
-            want_content = _need_content_enabled()
+            want_content = _need_content_enabled(self._get_setting)
             payload: dict[str, Any] = {"query": query, "count": count}
             if want_content:
                 payload["need_content"] = True
+            localization = _localization(self._get_setting)
+            if localization:
+                payload["localization"] = localization
             data = self._post(_SEARCH_URL, payload)
             rows = data.get("results") or []
             hits: list[dict[str, Any]] = []
@@ -366,7 +462,7 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
         if not self.is_available():
             err = _missing_key_error()
             return [{"url": u, "title": "", "content": "", "error": err} for u in urls]
-        deadline = _monotonic() + _EXTRACT_DEADLINE_S
+        deadline = _monotonic() + _extract_deadline(self._get_setting)
         out: list[dict[str, Any]] = []
         for url in urls:
             try:
@@ -410,4 +506,11 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
 
 
 def register(ctx) -> None:
-    ctx.register_web_search_provider(DeepSeekWebSearchProvider())
+    # The settings surface (plugins.entries.<id>.settings) is what makes
+    # `need_content` live: the reader is called per search, and Hermes' config
+    # cache is file-signature keyed, so a settings change lands on the next
+    # search without restarting the session. On a host that predates it there is
+    # no get_config, and the provider falls back to the environment variable.
+    reader = getattr(ctx, "get_config", None)
+    get_setting = (lambda key: reader(key, default=None)) if reader is not None else None
+    ctx.register_web_search_provider(DeepSeekWebSearchProvider(get_setting))

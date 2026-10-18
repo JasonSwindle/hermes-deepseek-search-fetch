@@ -1,6 +1,6 @@
 name: deepseek-search-fetch
 version: 1.0.6
-description: "DeepSeek Search & Fetch as a Hermes web backend: routes web_search and web_extract through api.deepseek.com/v1/tools/search and /v1/tools/fetch with your own key. Hits carry rerank_score, authority, date, site_name and site_icon so a result set can be filtered and attributed before anything is fetched, and fetched Markdown has the vendor's punctuation escaping reversed. DEEPSEEK_SEARCH_NEED_CONTENT=1 returns each hit's page text as clean Markdown. Billed by DeepSeek at $0.75 per 1,000 successful requests (failed calls and empty results are free); 5 QPS per account, and fetch takes one URL per call. Community plugin, not affiliated with DeepSeek."
+description: "DeepSeek Search & Fetch as a Hermes web backend: routes web_search and web_extract through api.deepseek.com/v1/tools/search and /v1/tools/fetch with your own key. Hits carry rerank_score, authority, date, site_name and site_icon so a result set can be filtered and attributed before anything is fetched, and fetched Markdown has the vendor's punctuation escaping reversed. A need_content setting returns each hit's page text as clean Markdown. Billed by DeepSeek at $0.75 per 1,000 successful requests (failed calls and empty results are free); 5 QPS per account, and fetch takes one URL per call. Community plugin, not affiliated with DeepSeek."
 author: Jason Swindle
 license: MIT
 homepage: https://github.com/JasonSwindle/hermes-deepseek-search-fetch
@@ -12,3 +12,16 @@ requires_env:
     description: "DeepSeek API key for the Search & Fetch tools (billed per successful request)."
     url: https://platform.deepseek.com/api_keys
     secret: true
+config_schema:
+  need_content:
+    type: bool
+    default: false
+    description: "Send need_content so each search hit carries its page text as clean Markdown. Off by default: a live run returned 20 KB for one hit, so a result set can cost tens of KB of context. A query already in Hermes' 20-minute search cache keeps its cached shape until the cache expires."
+  localization:
+    type: str
+    default: ""
+    description: "Optional IP address the Search API localises results to. Empty sends nothing; a value that is not an IP is ignored with a warning rather than sent."
+  extract_deadline:
+    type: int
+    default: 110
+    description: "Seconds one multi-URL web_extract may spend starting requests, clamped to 5-115. Must stay below web.extract_timeout (120 by default); lower it if you lowered that."
