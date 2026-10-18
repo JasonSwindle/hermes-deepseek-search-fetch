@@ -11,9 +11,12 @@ and httpx (both guaranteed present — every sibling provider uses httpx).
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import random
 import re
+import time
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -55,6 +58,28 @@ _SEARCH_URL = f"{_BASE}/v1/tools/search"
 _FETCH_URL = f"{_BASE}/v1/tools/fetch"
 _TIMEOUT = 30.0
 _SEARCH_LIMIT_CAP = 50  # DeepSeek count: 1-50
+
+# Search & Fetch are read-only, and the vendor's rule for them is specific:
+# wait and retry HTTP 408, 429 and 5xx; top up on 402; send every other 4xx
+# once. The wait is per call. Search and Fetch have separate 5 QPS account
+# caps, Fetch adds a per-domain cap, and other processes on the account are
+# invisible here, so a queue in this process would not be the account's limit.
+# Two quick retries clear a one-second QPS bucket. The 40s budget leaves a slow
+# 5xx (each attempt may use the whole 30s timeout) room for one retry. Extract
+# walks URLs one by one, and Hermes abandons the whole batch at 120s — pages
+# already fetched included — so the batch itself stops starting requests at 85s.
+# One attempt still in flight can use the 30s timeout and the call returns
+# inside the default cap.
+# The limit is the length of the backoff list, so adding a wait cannot
+# index off the end of the tuple.
+_RETRY_BACKOFF_S = (1.0, 2.0)
+_RETRY_LIMIT = len(_RETRY_BACKOFF_S)
+_RETRY_JITTER_S = 0.25
+_RETRY_BUDGET_S = 40.0
+_EXTRACT_DEADLINE_S = 85.0
+_BATCH_DEADLINE = "batch deadline reached"
+_DETAIL_CAP = 300
+_TOP_UP = "Top up the DeepSeek account before retrying."
 
 # Unpaired surrogates (U+D800-U+DFFF) are not encodable in UTF-8: httpx's JSON
 # serialization raises before the request is sent. Replace them the way any
@@ -111,6 +136,107 @@ def _missing_key_error() -> str:
     )
 
 
+def _is_retryable(status: int) -> bool:
+    """True for the statuses the Search & Fetch guide says to wait out."""
+    return status in {408, 429} or 500 <= status <= 599
+
+
+def _retry_suffix(retries: int) -> str:
+    """Empty until a retry has actually happened. One retry stays singular."""
+    if retries <= 0:
+        return ""
+    noun = "retry" if retries == 1 else "retries"
+    return f" (after {retries} {noun})"
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    """The header's whole value, when it is a positive number of seconds.
+
+    HTTP-dates, zero, negatives and non-numeric text are ignored. The caller
+    also ignores a value longer than this attempt's own backoff.
+    """
+    if value is None:
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        return None
+    if seconds <= 0 or seconds == float("inf") or seconds != seconds:
+        return None
+    return seconds
+
+
+def _retry_delay(resp: httpx.Response, retries: int) -> float:
+    """Backoff for this attempt, or Retry-After when it is a shorter wait.
+
+    Retry-After replaces the whole delay, jitter included. A value longer than
+    this attempt's backoff, or one this function cannot parse, leaves the
+    backoff and its jitter in place.
+    """
+    backoff = _RETRY_BACKOFF_S[retries]
+    seconds = _retry_after_seconds(resp.headers.get("Retry-After"))
+    if seconds is not None and seconds <= backoff:
+        return seconds
+    return backoff + _uniform(0.0, _RETRY_JITTER_S)
+
+
+def _error_message(raw: str) -> str | None:
+    """`error.message` when the body is the documented OpenAI error object."""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    err = data.get("error")
+    if not isinstance(err, dict):
+        return None
+    message = err.get("message")
+    if not isinstance(message, str):
+        return None
+    message = message.strip()
+    return message or None
+
+
+def _vendor_text(resp: httpx.Response) -> str:
+    """The vendor's own words, capped, with the raw body behind the message."""
+    raw = (resp.text or "").strip()
+    message = _error_message(raw)
+    if message is not None:
+        return message[:_DETAIL_CAP]
+    return raw[:_DETAIL_CAP] or (resp.reason_phrase or "")
+
+
+def _monotonic() -> float:
+    return time.monotonic()
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _uniform(low: float, high: float) -> float:
+    return random.uniform(low, high)
+
+
+def _request(url: str, payload: dict[str, Any], headers: dict[str, str]) -> httpx.Response:
+    return httpx.post(url, json=payload, headers=headers, timeout=_TIMEOUT)
+
+
+def _status_error(resp: httpx.Response, retries: int) -> RuntimeError:
+    """Error envelope for a non-200. 402 carries the top-up remedy."""
+    detail = _vendor_text(resp)
+    if resp.status_code == 402:
+        if not detail:
+            detail = "Insufficient balance"
+        text = f"HTTP 402: {detail}. {_TOP_UP}"
+    elif detail:
+        text = f"HTTP {resp.status_code}: {detail}"
+    else:
+        text = f"HTTP {resp.status_code}"
+    return RuntimeError(text + _retry_suffix(retries))
+
+
 class DeepSeekWebSearchProvider(WebSearchProvider):
     """DeepSeek Search & Fetch APIs as a Hermes web provider."""
 
@@ -131,24 +257,68 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return True
 
-    def _post(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
-        resp = httpx.post(
-            url,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {get_provider_env('DEEPSEEK_API_KEY')}",
-                "Content-Type": "application/json",
-            },
-            timeout=_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            detail = (resp.text or "").strip()[:300] or resp.reason_phrase or ""
-            raise RuntimeError(f"HTTP {resp.status_code}: {detail}")
-        try:
-            return resp.json()
-        except ValueError as exc:  # non-JSON body (HTML from a proxy/WAF/maintenance page)
-            snippet = (resp.text or "").strip()[:200]
-            raise RuntimeError(f"non-JSON response ({exc}); body: {snippet!r}") from exc
+    def _post(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        started = _monotonic()
+        retries = 0
+        # The last response, so a deadline that arrives before the next send
+        # can still report that status. None until the first response.
+        held: httpx.Response | None = None
+        while True:
+            if deadline is not None and _monotonic() >= deadline:
+                if held is None:
+                    raise RuntimeError(_BATCH_DEADLINE)
+                raise _status_error(held, retries)
+            try:
+                resp = _request(
+                    url,
+                    payload,
+                    {
+                        "Authorization": f"Bearer {get_provider_env('DEEPSEEK_API_KEY')}",
+                        "Content-Type": "application/json",
+                    },
+                )
+            except httpx.TransportError as exc:
+                # A dropped connection is not one of the documented statuses.
+                # Retrying it spends the 30s timeout again. Once a retry has
+                # already happened, keep that count on the error Hermes sees.
+                if retries == 0:
+                    raise
+                raise RuntimeError(f"{exc}{_retry_suffix(retries)}") from exc
+            held = resp
+            if resp.status_code == 200:
+                try:
+                    return resp.json()
+                except ValueError as exc:  # non-JSON body (HTML from a proxy/WAF/maintenance page)
+                    snippet = (resp.text or "").strip()[:200]
+                    raise RuntimeError(
+                        f"non-JSON response ({exc}); body: {snippet!r}{_retry_suffix(retries)}"
+                    ) from exc
+            now = _monotonic()
+            elapsed = now - started
+            # Same clock reading for the budget and the batch deadline, so a
+            # slow response and the sleep that would follow it are judged once.
+            if (
+                not _is_retryable(resp.status_code)
+                or retries >= _RETRY_LIMIT
+                or elapsed >= _RETRY_BUDGET_S
+            ):
+                raise _status_error(resp, retries)
+            delay = _retry_delay(resp, retries)
+            past_budget = elapsed + delay >= _RETRY_BUDGET_S
+            past_deadline = deadline is not None and now + delay >= deadline
+            if past_budget or past_deadline:
+                raise _status_error(resp, retries)
+            logger.warning(
+                "DeepSeek HTTP %s, retry %d/%d",
+                resp.status_code, retries + 1, _RETRY_LIMIT,
+            )
+            _sleep(delay)
+            retries += 1
 
     def search(self, query: str, limit: int = 5) -> dict[str, Any]:
         if not self.is_available():
@@ -196,10 +366,11 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
         if not self.is_available():
             err = _missing_key_error()
             return [{"url": u, "title": "", "content": "", "error": err} for u in urls]
+        deadline = _monotonic() + _EXTRACT_DEADLINE_S
         out: list[dict[str, Any]] = []
         for url in urls:
             try:
-                data = self._post(_FETCH_URL, {"url": url})
+                data = self._post(_FETCH_URL, {"url": url}, deadline)
                 title = data.get("title") or ""
                 # Both fields hold the unescaped Markdown on purpose: Hermes
                 # prefers raw_content when it derives the model-visible content

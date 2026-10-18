@@ -48,6 +48,14 @@ against a broken copy proves nothing. Same for the unescaper: neuter
   loopback test host. Everything else is refused with a warning and the default is
   used — the bearer key must not be redirectable by an environment variable.
 - No `limit` outside 1–50 may reach the API, and the key must never be logged.
+- Retries are only for HTTP 408, 429 and 5xx, at most once per entry of
+  `_RETRY_BACKOFF_S`. A 200 whose body is not JSON still carries that retry count.
+  A positive `Retry-After` in seconds replaces an attempt's wait when it is no
+  longer than that attempt's backoff. Retry log lines carry the status and the
+  attempt number, and they follow the key rule above.
+- A multi-URL `extract()` stops starting requests `_EXTRACT_DEADLINE_S` after it
+  began, so pages already fetched survive Hermes' extract timeout: they stay in
+  the returned list and only the skipped URLs carry an error.
 
 ## Do not
 

@@ -33,6 +33,14 @@ DEFAULT_BASE = "https://api.deepseek.com"
 DUMMY_KEY = "unit-test-key"
 _URL = "/v1/tools/search"
 _FETCH = "/v1/tools/fetch"
+_RATE_LIMIT = {
+    "error": {
+        "message": "Rate limit reached",
+        "type": "rate_limit_error",
+        "param": None,
+        "code": "rate_limit_error",
+    }
+}
 
 
 def install_stub() -> None:
@@ -83,6 +91,33 @@ def provider(name: str, base_url=None, api_key: str = DUMMY_KEY):
     return load_plugin(name, base_url, api_key).DeepSeekWebSearchProvider()
 
 
+def fast_clock(mod, advance: float = 0.0):
+    """Replace the retry clock so a backoff does not stall the suite.
+
+    `advance` is added on every POST. A test uses it to pretend the server
+    took that long, which is what the 40s budget keys off.
+    """
+    state = {"now": 0.0, "sleeps": []}
+    real_request = mod._request
+
+    def monotonic():
+        return state["now"]
+
+    def sleep(seconds):
+        state["sleeps"].append(seconds)
+        state["now"] += seconds
+
+    def request(url, payload, headers):
+        state["now"] += advance
+        return real_request(url, payload, headers)
+
+    mod._monotonic = monotonic
+    mod._sleep = sleep
+    mod._uniform = lambda a, b: 0.0
+    mod._request = request
+    return state
+
+
 # ── mock vendor ───────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     requests: list = []
@@ -106,6 +141,33 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(n) if n else b""
         type(self).requests.append({"path": self.path, "headers": dict(self.headers), "body": body})
         prefix = self.path.split("/v1/")[0]
+        if prefix.startswith("/html429"):
+            seen = sum(1 for r in type(self).requests if "/html429" in r["path"])
+            if seen == 1:
+                return self._send(429, _RATE_LIMIT)
+            return self._send_raw(200, b"<html>not json</html>")
+        if prefix.startswith("/once429"):
+            seen = sum(1 for r in type(self).requests if "/once429" in r["path"])
+            if seen == 1:
+                return self._send(429, _RATE_LIMIT)
+            return self._send_raw(200, type(self).search_body)
+        if prefix.startswith("/ra_short"):
+            return self._send(429, _RATE_LIMIT, {"Retry-After": "0.5"})
+        if prefix.startswith("/ra_long"):
+            return self._send(429, _RATE_LIMIT, {"Retry-After": "9"})
+        if prefix.startswith("/ra_date"):
+            return self._send(429, _RATE_LIMIT, {"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"})
+        if prefix.startswith("/ra_zero"):
+            return self._send(429, _RATE_LIMIT, {"Retry-After": "0"})
+        if prefix.startswith("/long400"):
+            return self._send(400, {"error": {"message": "m" * 400, "type": "invalid_request_error",
+                                              "param": None, "code": "invalid_request_error"}})
+        if prefix.startswith("/badmsg"):
+            return self._send_raw(400, b'{"error": {"message": 1}}')
+        if prefix.startswith("/s") and prefix[2:].isdigit():
+            code = int(prefix[2:])
+            return self._send(code, {"error": {"message": f"status {code}", "type": "error",
+                                               "param": None, "code": "error"}})
         if prefix.startswith("/r429"):
             return self._send(429, {"error": {"message": "Rate limit reached", "type": "rate_limit_error"}})
         if prefix.startswith("/err"):
@@ -138,12 +200,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_raw(200, type(self).fetch_body)
         return self._send_raw(200, type(self).search_body)
 
-    def _send(self, code, obj):
-        self._send_raw(code, json.dumps(obj).encode())
+    def _send(self, code, obj, headers=None):
+        self._send_raw(code, json.dumps(obj).encode(), headers)
 
-    def _send_raw(self, code, payload: bytes):
+    def _send_raw(self, code, payload: bytes, headers=None):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -392,8 +456,9 @@ class TestExtractContract(MockVendor):
                          ["https://example.invalid/1", "https://example.invalid/2"])
 
     def test_failure_shape_is_per_entry(self):
-        p = provider("e_err", f"{self.base}/err")
-        out = p.extract(["https://example.invalid/x"])
+        mod = load_plugin("e_err", f"{self.base}/err")
+        fast_clock(mod)
+        out = mod.DeepSeekWebSearchProvider().extract(["https://example.invalid/x"])
         self.assertIn("error", out[0])
         self.assertIn("HTTP 500", out[0]["error"])
 
@@ -414,24 +479,274 @@ class TestErrorPaths(MockVendor):
         e = p.extract(["https://example.invalid/x"])
         self.assertIn("DEEPSEEK_API_KEY", e[0]["error"])
 
-    def test_rate_limit_shape(self):
-        p = provider("err_429", f"{self.base}/r429")
-        out = p.search("q")
-        self.assertFalse(out["success"])
-        self.assertIn("HTTP 429", out["error"])
-        self.assertEqual(len(Handler.requests), 1)  # no retry
+    def test_rate_limit_is_retried_then_reported(self):
+        mod = load_plugin("err_429", f"{self.base}/r429")
+        clock = fast_clock(mod)
+        with self.assertLogs(mod.__name__, level="WARNING") as captured:
+            out = mod.DeepSeekWebSearchProvider().search("q")
+        self.assertEqual(
+            out["error"],
+            "DeepSeek search failed: HTTP 429: Rate limit reached (after 2 retries)",
+        )
+        self.assertEqual(len(Handler.requests), 3)
+        self.assertEqual(clock["sleeps"], [1.0, 2.0])
+        retry_lines = [line for line in captured.output if "retry " in line]
+        self.assertEqual(retry_lines, [
+            f"WARNING:{mod.__name__}:DeepSeek HTTP 429, retry 1/2",
+            f"WARNING:{mod.__name__}:DeepSeek HTTP 429, retry 2/2",
+        ])
+        self.assertNotIn(DUMMY_KEY, "\n".join(captured.output))
+
+    def test_retry_then_success_keeps_the_result_shape(self):
+        mod = load_plugin("retry_ok", f"{self.base}/once429")
+        clock = fast_clock(mod)
+        out = mod.DeepSeekWebSearchProvider().search("q", limit=2)
+        self.assertTrue(out["success"], out)
+        self.assertEqual(set(out), {"success", "data"})
+        self.assertEqual(set(out["data"]), {"web"})
+        self.assertEqual(len(Handler.requests), 2)
+        self.assertEqual(clock["sleeps"], [1.0])
+        self.assertNotIn("retry", json.dumps(out))
+
+    def test_extract_rate_limit_stays_a_per_entry_error(self):
+        mod = load_plugin("retry_ext", f"{self.base}/r429")
+        fast_clock(mod)
+        out = mod.DeepSeekWebSearchProvider().extract(["https://example.invalid/x"])
+        self.assertEqual(
+            out[0]["error"],
+            "DeepSeek fetch failed: HTTP 429: Rate limit reached (after 2 retries)",
+        )
+        self.assertNotIn("blocked_by_policy", out[0])
+
+    def test_terminal_statuses_are_single_shot(self):
+        for code in (400, 403, 404):
+            with self.subTest(code=code):
+                Handler.requests.clear()
+                mod = load_plugin(f"term_{code}", f"{self.base}/s{code}")
+                clock = fast_clock(mod)
+                out = mod.DeepSeekWebSearchProvider().search("q")
+                self.assertEqual(
+                    out["error"],
+                    f"DeepSeek search failed: HTTP {code}: status {code}",
+                )
+                self.assertEqual(len(Handler.requests), 1)
+                self.assertEqual(clock["sleeps"], [])
+
+    def test_payment_required_says_to_top_up(self):
+        mod = load_plugin("err_402", f"{self.base}/s402")
+        clock = fast_clock(mod)
+        out = mod.DeepSeekWebSearchProvider().search("q")
+        self.assertEqual(
+            out["error"],
+            "DeepSeek search failed: HTTP 402: status 402. "
+            "Top up the DeepSeek account before retrying.",
+        )
+        self.assertEqual(len(Handler.requests), 1)
+        self.assertEqual(clock["sleeps"], [])
+
+    def test_empty_402_says_insufficient_balance(self):
+        mod = load_plugin("err_402empty", f"{self.base}/ok")
+
+        def request(*_a, **_k):
+            return mod.httpx.Response(402, content=b"", extensions={"reason_phrase": b""})
+
+        mod._request = request
+        out = mod.DeepSeekWebSearchProvider().search("q")
+        self.assertEqual(
+            out["error"],
+            "DeepSeek search failed: HTTP 402: Insufficient balance. "
+            "Top up the DeepSeek account before retrying.",
+        )
+
+    def test_vendor_message_is_capped_at_300_characters(self):
+        mod = load_plugin("err_long", f"{self.base}/long400")
+        fast_clock(mod)
+        out = mod.DeepSeekWebSearchProvider().search("q")
+        self.assertEqual(out["error"], "DeepSeek search failed: HTTP 400: " + ("m" * 300))
+
+    def test_non_string_error_message_falls_back_to_the_body(self):
+        mod = load_plugin("err_badmsg", f"{self.base}/badmsg")
+        fast_clock(mod)
+        out = mod.DeepSeekWebSearchProvider().search("q")
+        self.assertEqual(
+            out["error"],
+            'DeepSeek search failed: HTTP 400: {"error": {"message": 1}}',
+        )
+        self.assertEqual(len(Handler.requests), 1)
+
+    def test_transient_statuses_are_retried(self):
+        for code in (408, 500, 503):
+            with self.subTest(code=code):
+                Handler.requests.clear()
+                mod = load_plugin(f"transient_{code}", f"{self.base}/s{code}")
+                clock = fast_clock(mod)
+                out = mod.DeepSeekWebSearchProvider().search("q")
+                self.assertEqual(
+                    out["error"],
+                    f"DeepSeek search failed: HTTP {code}: status {code} (after 2 retries)",
+                )
+                self.assertEqual(len(Handler.requests), 3)
+                self.assertEqual(clock["sleeps"], [1.0, 2.0])
 
     def test_non_200_carries_status_and_detail(self):
-        p = provider("err_500", f"{self.base}/err")
-        out = p.search("q")
-        self.assertIn("HTTP 500", out["error"])
-        self.assertIn("boom", out["error"])
+        mod = load_plugin("err_500", f"{self.base}/err")
+        fast_clock(mod)
+        out = mod.DeepSeekWebSearchProvider().search("q")
+        self.assertEqual(out["error"], "DeepSeek search failed: HTTP 500: boom (after 2 retries)")
+        self.assertEqual(len(Handler.requests), 3)
+
+    def test_transport_error_is_not_retried(self):
+        mod = load_plugin("err_conn", f"{self.base}/ok")
+        sleeps = []
+        mod._sleep = lambda seconds: sleeps.append(seconds)
+
+        def request(*_a, **_k):
+            raise mod.httpx.ConnectError("connection refused")
+
+        mod._request = request
+        out = mod.DeepSeekWebSearchProvider().search("q")
+        self.assertFalse(out["success"])
+        self.assertIn("connection refused", out["error"])
+        self.assertNotIn("(after ", out["error"])
+        self.assertEqual(sleeps, [])
+
+    def test_transport_error_after_a_retry_keeps_the_count(self):
+        mod = load_plugin("err_conn_retry", f"{self.base}/ok")
+        clock = fast_clock(mod)
+        calls = {"n": 0}
+
+        def request(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return mod.httpx.Response(429, json=_RATE_LIMIT)
+            raise mod.httpx.ConnectError("connection refused")
+
+        mod._request = request
+        out = mod.DeepSeekWebSearchProvider().search("q")
+        self.assertIn("connection refused", out["error"])
+        self.assertIn("(after 1 retry)", out["error"])
+        self.assertEqual(clock["sleeps"], [1.0])
+        self.assertEqual(calls["n"], 2)
+
+    def test_retry_after_replaces_a_shorter_wait(self):
+        mod = load_plugin("ra_short", f"{self.base}/ra_short")
+        clock = fast_clock(mod)
+        mod._uniform = lambda _a, _b: 0.25
+        out = mod.DeepSeekWebSearchProvider().search("q")
+        self.assertIn("(after 2 retries)", out["error"])
+        self.assertEqual(clock["sleeps"], [0.5, 0.5])
+
+    def test_retry_after_is_ignored_unless_it_is_a_short_delay(self):
+        for name in ("ra_long", "ra_date", "ra_zero"):
+            with self.subTest(name=name):
+                Handler.requests.clear()
+                mod = load_plugin(name, f"{self.base}/{name}")
+                clock = fast_clock(mod)
+                mod._uniform = lambda _a, _b: 0.25
+                mod.DeepSeekWebSearchProvider().search("q")
+                self.assertEqual(clock["sleeps"], [1.25, 2.25])
+
+    def test_retry_stops_when_the_budget_is_spent(self):
+        mod = load_plugin("budget_slow", f"{self.base}/err")
+        clock = fast_clock(mod, advance=30.0)
+        with self.assertLogs(mod.__name__, level="WARNING") as captured:
+            out = mod.DeepSeekWebSearchProvider().search("q")
+        self.assertIn("(after 1 retry)", out["error"])
+        self.assertEqual(len(Handler.requests), 2)
+        self.assertEqual(clock["sleeps"], [1.0])
+        self.assertEqual(
+            [line for line in captured.output if "retry " in line],
+            [f"WARNING:{mod.__name__}:DeepSeek HTTP 500, retry 1/2"],
+        )
+
+    def test_extract_batch_stops_at_the_shared_deadline(self):
+        mod = load_plugin("batch_deadline", f"{self.base}/err")
+        clock = fast_clock(mod, advance=30.0)
+        urls = [
+            "https://example.invalid/1",
+            "https://example.invalid/2",
+            "https://example.invalid/3",
+        ]
+        out = mod.DeepSeekWebSearchProvider().extract(urls)
+        self.assertEqual([entry["url"] for entry in out], urls)
+        self.assertEqual(
+            out[0]["error"],
+            "DeepSeek fetch failed: HTTP 500: boom (after 1 retry)",
+        )
+        self.assertEqual(out[1]["error"], "DeepSeek fetch failed: HTTP 500: boom")
+        self.assertEqual(
+            out[2]["error"],
+            "DeepSeek fetch failed: batch deadline reached",
+        )
+        self.assertNotIn("raw_content", out[2])
+        self.assertEqual(len(Handler.requests), 3)
+        self.assertEqual(clock["sleeps"], [1.0])
+
+    def test_pages_fetched_before_the_deadline_are_kept(self):
+        mod = load_plugin("batch_keep", f"{self.base}/ok")
+        # Two separate claims, so neither can hide the other:
+        # 1. the shipped deadline is sane — inside Hermes' default 120s extract
+        #    cap, and positive (a huge value silently disables the guard, while a
+        #    negative one skips every URL);
+        self.assertLess(mod._EXTRACT_DEADLINE_S, 120)
+        self.assertGreater(mod._EXTRACT_DEADLINE_S, 0)
+        # 2. once the deadline is reached the remaining URLs are skipped and the
+        #    pages already fetched stay in the list. The deadline is pinned here
+        #    and stepped with a fixed 30s, so tuning the constant cannot move the
+        #    goalposts while a removed deadline still fails the request count.
+        mod.__dict__.update(_EXTRACT_DEADLINE_S=85.0)  # dynamic module; untyped on purpose
+        fast_clock(mod, advance=30.0)
+        urls = [f"https://example.invalid/{i}" for i in range(4)]
+        out = mod.DeepSeekWebSearchProvider().extract(urls)
+        self.assertEqual([entry["url"] for entry in out], urls)
+        for entry in out[:3]:
+            self.assertNotIn("error", entry)
+            self.assertRegex(entry["content"], r"^# Mock content")
+            self.assertEqual(entry["raw_content"], entry["content"])
+        self.assertEqual(out[3].get("error"), "DeepSeek fetch failed: batch deadline reached")
+        self.assertEqual(len(Handler.requests), 3)
+
+    def test_fast_rate_limits_still_retry_inside_a_batch(self):
+        mod = load_plugin("batch_429", f"{self.base}/r429")
+        clock = fast_clock(mod)
+        urls = [
+            "https://example.invalid/1",
+            "https://example.invalid/2",
+            "https://example.invalid/3",
+        ]
+        out = mod.DeepSeekWebSearchProvider().extract(urls)
+        self.assertEqual(len(out), 3)
+        for entry in out:
+            self.assertIn("(after 2 retries)", entry["error"])
+            self.assertNotIn("batch deadline", entry["error"])
+        self.assertEqual(len(Handler.requests), 9)
+        self.assertEqual(clock["sleeps"], [1.0, 2.0, 1.0, 2.0, 1.0, 2.0])
+
+    def test_retry_stops_before_a_sleep_would_cross_the_budget(self):
+        mod = load_plugin("budget_edge", f"{self.base}/err")
+        clock = fast_clock(mod, advance=39.5)
+        with self.assertLogs(mod.__name__, level="WARNING") as captured:
+            out = mod.DeepSeekWebSearchProvider().search("q")
+        self.assertEqual(out["error"], "DeepSeek search failed: HTTP 500: boom")
+        self.assertEqual(len(Handler.requests), 1)
+        self.assertEqual(clock["sleeps"], [])
+        self.assertFalse(any("retry " in line for line in captured.output))
 
     def test_non_json_200_is_labelled(self):
         p = provider("err_html", f"{self.base}/html")
         out = p.search("q")
         self.assertFalse(out["success"])
         self.assertIn("non-JSON response", out["error"])
+        self.assertNotIn("(after ", out["error"])
+
+    def test_non_json_200_after_a_retry_keeps_the_count(self):
+        mod = load_plugin("err_html_retry", f"{self.base}/html429")
+        fast_clock(mod)
+        out = mod.DeepSeekWebSearchProvider().search("q")
+        self.assertFalse(out["success"])
+        self.assertIn("non-JSON response", out["error"])
+        self.assertTrue(out["error"].endswith("(after 1 retry)"))
+        self.assertEqual(len(Handler.requests), 2)
 
     def test_none_limit_is_graceful(self):
         p = provider("err_none", f"{self.base}/ok")
