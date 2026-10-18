@@ -15,7 +15,9 @@ needs no API key.
 What this tier deliberately does NOT prove: that the plugin matches the *real*
 Hermes provider interface, and how the dispatcher treats it (memo, disk cache,
 rescue, provenance). Those need a Hermes install and live in the integration
-tier (`dsweb-integration.py`, `dsweb-live-accept.py`).
+tier, `dsweb-integration.py` at the repo root — it installs the plugin into a
+throwaway HERMES_HOME through `hermes plugins install --ref <sha>`, points it at
+a loopback mock and drives the real `web_search` / `web_extract` dispatcher.
 """
 import importlib.util
 import json

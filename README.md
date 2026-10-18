@@ -170,13 +170,25 @@ Settings live under `plugins.entries.<id>.settings.<key>`, and `<id>` depends on
 Offline, keyless and unbilled: a loopback mock server stands in for the vendor, and a small stub lets the plugin import **without a Hermes install**, so the suite runs anywhere.
 
 ```bash
-# Zero-dependency tier (stdlib unittest only) — 52 tests (51 + a skip placeholder)
+# Zero-dependency tier (stdlib unittest only) — 60 tests (59 + a skip placeholder)
 python -m unittest discover -s tests
 
-# Full tier, adding Hypothesis property tests — 59 tests
+# Full tier, adding Hypothesis property tests — 67 tests
 uv venv .venv-dev
 uv pip install --python .venv-dev/bin/python -r requirements-dev.txt
 .venv-dev/bin/python -m unittest discover -s tests
+```
+
+Neither tier loads Hermes, so neither can prove the plugin matches the provider interface or how the
+dispatcher treats it. That is what `dsweb-integration.py` is for: it installs the plugin into a
+throwaway `HERMES_HOME` the way a stranger does, points `DEEPSEEK_BASE_URL` at a loopback mock (which
+the base-URL guard allows) and drives the real `web_search` / `web_extract` path — 19 checks covering
+the settings surface, retry behaviour, extract unescaping, per-URL errors and the search-memo caveat.
+Offline, keyless and unbilled; run it by hand before a release:
+
+```bash
+python dsweb-integration.py --hermes-home /tmp/dsw-it --hermes /path/to/hermes \
+  --install <40-char-sha>
 ```
 
 The property tier generates arbitrary Unicode — including unpaired surrogates, which Hypothesis' default `st.text()` alphabet deliberately excludes — and asserts the invariant that made it necessary: whatever a caller passes, a UTF-8-encodable value reaches the wire. Point `DEEPSEEK_PLUGIN_PATH` at another copy of the plugin to test that copy; the falsification procedure and the invariants that must not break live in [AGENTS.md](AGENTS.md).

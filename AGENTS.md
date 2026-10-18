@@ -20,6 +20,16 @@ Run both before declaring any change done. The suite is offline by construction 
 loopback mock server stands in for the vendor and `DEEPSEEK_BASE_URL` is what points
 at it. Never aim the tests at the real API; nothing in `tests/` should ever need a key.
 
+Then the tier that actually proves the plugin fits Hermes (neither unittest tier can):
+
+```bash
+python dsweb-integration.py --hermes-home /tmp/dsw-it --hermes /path/to/hermes --install <sha>
+```
+
+It installs the plugin into a throwaway HERMES_HOME through `hermes plugins install --ref <sha>`,
+points it at a loopback mock, and drives the real dispatcher: settings at call time, retry counts,
+extract unescaping, per-URL errors, the search-memo caveat. Run it before every release pin.
+
 Falsification check (do this when you touch the sanitizer or the guard): make a copy
 of the plugin with `_utf8_safe` neutered to `return text`, run the suite with
 `DEEPSEEK_PLUGIN_PATH=<copy>`, and confirm it goes **red**. A suite that stays green
