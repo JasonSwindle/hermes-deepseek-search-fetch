@@ -4,9 +4,10 @@ Routes Hermes' web_search / web_extract tools through DeepSeek's Search & Fetch
 tools APIs: POST https://api.deepseek.com/v1/tools/search and /v1/tools/fetch.
 Billing: $0.75 / 1,000 successful requests (failures and empty results free).
 Rate limits: the guide lists 100 QPS for Search and 25 QPS for Fetch per
-account (Fetch also has a per-domain cap); a live 429 has reported a current
-QPS of 5, so treat the effective ceiling as account-dependent. Key:
-DEEPSEEK_API_KEY (declared in plugin.yaml requires_env).
+account (Fetch also has a per-domain cap); live 429s have reported a current
+QPS of 5 (2026-10-18) and 25 (Fetch, 2026-10-19), so treat the effective
+ceiling as account-dependent. Key: DEEPSEEK_API_KEY (declared in plugin.yaml
+requires_env).
 
 Self-contained on purpose: the bundled helpers (plugins/web/_common.py) are
 internal to the shipped tree; a user plugin imports only agent.web_search_provider
@@ -81,10 +82,13 @@ _SEARCH_LIMIT_CAP = 50  # DeepSeek count: 1-50
 # Search & Fetch are read-only, and the vendor's rule for them is specific:
 # wait and retry HTTP 408, 429 and 5xx; top up on 402; send every other 4xx
 # once. The wait is per call. The guide lists 100 QPS for Search and 25 QPS for
-# Fetch per account, and Fetch also has a per-domain cap; a live 429 has
-# reported a current QPS of 5, so the effective ceiling is account-dependent.
-# Other processes on the account are invisible here, so a queue in this process
-# would not be the account's limit. Two quick retries clear a one-second bucket.
+# Fetch per account, and Fetch also has a per-domain cap; live 429s have
+# reported a current QPS of 5 (2026-10-18) and 25 (Fetch, 2026-10-19), so the
+# effective ceiling is account-dependent. A manual 2026-10-19 probe had 40
+# concurrent extracts hit 13 real 429s and recover on the first 1s+jitter retry;
+# DeepSeek sent no Retry-After header. Other processes on the account are
+# invisible here, so a queue in this process would not be the account's limit.
+# Two quick retries clear a one-second bucket.
 #
 # The 40s budget bounds the CALL, not just the wait: a retry is only scheduled
 # when the attempt it schedules still fits inside the budget, so a slow call

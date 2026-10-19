@@ -47,6 +47,12 @@ And once, before a release pin — the only run that touches the vendor, and the
 money (~$0.004): `python dsweb-live-accept.py --spend`. It now captures the raw fetch/search bodies
 and asserts the vendor-escaping premise before unescaping; it needs a real key; never wire it into CI.
 
+The live acceptance does not normally provoke 429s. A one-off manual probe on 2026-10-19 did: a
+30-request same-domain Fetch burst produced three 429s (`Your current QPS: 25`, no `Retry-After`),
+and 40 concurrent `extract()` calls produced 13 real 429s — all 40 recovered on the first 1s+jitter
+retry. That is recorded evidence for the docs, not a CI test; do not wire load generation into the
+suite or run it routinely.
+
 Falsification check (do this when you touch the sanitizer, unescaper, guard, key path, deadline, or
 response mapping): make a copy of the plugin with the relevant guard neutered — `_utf8_safe` to
 `return text`, `_unescape_markdown` to `return text`, `_api_key` to `return os.environ.get(...)`,
