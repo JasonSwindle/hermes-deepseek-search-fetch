@@ -9,7 +9,7 @@ body:
         Thanks for the report. Please check these first:
 
         - [ ] I searched [existing issues](https://github.com/JasonSwindle/hermes-deepseek-search-fetch/issues) for a duplicate
-        - [ ] I restarted the session — routing changes only take effect on the **next** session
+        - [ ] I restarted the session after installing/enabling the plugin (routing and settings changes on an already-loaded plugin take effect on the next tool call)
         - [ ] I redacted my API key. **Never paste it** — write `***` instead
 
         Security problems do **not** belong here; see the security policy link on the new-issue page.
@@ -133,8 +133,8 @@ body:
     attributes:
       label: Validation output (optional)
       description: |
-        If the problem is with loading or installing, paste the output of:
-        `hermes plugins validate` and `hermes plugins doctor` (see the Diagnostics section in the README).
+        If the problem is with loading or installing, paste the output of
+        `hermes plugins validate <path>` and `hermes plugins doctor`.
       render: shell
 
   - type: checkboxes

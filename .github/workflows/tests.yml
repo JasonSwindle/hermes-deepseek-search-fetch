@@ -33,11 +33,15 @@ jobs:
           python -m pip install --disable-pip-version-check httpx
           python -m unittest discover -s tests
 
-      # Tier 2: the pinned dev extras add Hypothesis to the same suite, so the
-      # property tests stop skipping.
+      # Tier 2: the pinned dev extras add Hypothesis to the same suite. The env
+      # var makes a missing/broken Hypothesis import fail instead of quietly
+      # turning the property tier into the one skip placeholder.
       - name: Full tier (property tests)
+        env:
+          REQUIRE_HYPOTHESIS: "1"
         run: |
           python -m pip install --disable-pip-version-check -r requirements-dev.txt
+          python -c "import hypothesis; print('hypothesis', hypothesis.__version__)"
           python -m unittest discover -s tests
 
   # Per-commit plugin validation is NOT duplicated here: the Hermes plugin catalog

@@ -25,6 +25,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 try:
     from hypothesis import HealthCheck, given, settings
@@ -37,6 +38,7 @@ except ImportError:  # pragma: no cover - dev extra not installed
 # Repo default: the plugin sits at the repo root, one level up from this tests/ dir.
 PLUGIN = Path(os.environ.get("DEEPSEEK_PLUGIN_PATH") or Path(__file__).resolve().parent.parent / "__init__.py")
 DUMMY_KEY = "property-test-key"
+DEFAULT_BASE = "https://api.deepseek.com"
 DEFAULT_PAYLOAD = json.dumps(
     {"results": [{"title": "t", "url": "https://x.invalid/", "summary": "s"}]}
 ).encode()
@@ -125,6 +127,7 @@ if HAVE_HYPOTHESIS:
     UTF8_TEXT = st.text(alphabet=st.characters(codec="utf-8"))
     FAST = settings(deadline=None, max_examples=200)
     HTTP_OK = settings(deadline=None, max_examples=25, suppress_health_check=[HealthCheck.too_slow])
+    GUARD = settings(deadline=None, max_examples=100)
     # ASCII punctuation is exactly what the fetch endpoint backslashes. Text with
     # no backslash of its own is where escaping and unescaping are invertible.
     PUNCT = {c for c in map(chr, range(0x21, 0x7F)) if not c.isalnum()}
@@ -183,6 +186,39 @@ if HAVE_HYPOTHESIS:
             escaped = "".join("\\" + c if c in PUNCT else c for c in text)
             self.assertEqual(pure_module()._unescape_markdown(escaped), text)
 
+        @given(ANY_TEXT)
+        @settings(FAST)
+        def test_unescape_inverts_escaping_including_backslashes(self, text):
+            """Escaping the backslash too must round-trip: a page containing
+            ``\\#`` or ``C:\\path`` is not corrupted by the inverse."""
+            escaped = "".join("\\" + c if c == "\\" or c in PUNCT else c for c in text)
+            self.assertEqual(pure_module()._unescape_markdown(escaped), text)
+
+        @given(st.one_of(st.floats(allow_nan=True, allow_infinity=True), st.integers()))
+        @settings(FAST)
+        def test_extract_deadline_is_always_finite_and_clamped(self, value):
+            mod = pure_module()
+            mod._hermes_extract_timeout = lambda: None
+            deadline = mod._extract_deadline(lambda _k: value)
+            self.assertGreaterEqual(deadline, mod._EXTRACT_DEADLINE_MIN_S)
+            self.assertLessEqual(deadline, mod._EXTRACT_DEADLINE_MAX_S)
+
+        @given(st.text(alphabet=st.characters(codec="utf-8", blacklist_characters="\x00")))
+        @settings(GUARD)
+        def test_base_url_guard_is_total_and_never_leaves_the_allowlist(self, raw):
+            """No input can make the guard raise, and an accepted override never
+            points the bearer key at a host outside the allowlist."""
+            mod = load(raw)
+            parsed = urlsplit(mod._BASE)
+            host = (parsed.hostname or "").lower()
+            allowed = (
+                mod._BASE == DEFAULT_BASE
+                or (host == "api.deepseek.com" and parsed.scheme == "https")
+                or (host in {"127.0.0.1", "localhost", "::1"} and parsed.scheme in {"http", "https"})
+            )
+            self.assertTrue(allowed, mod._BASE)
+            self.assertFalse(parsed.username or parsed.password)
+
         # -- wire -------------------------------------------------------------
         @given(ANY_TEXT)
         @settings(HTTP_OK)
@@ -197,13 +233,15 @@ if HAVE_HYPOTHESIS:
 
         @given(ANY_TEXT)
         @settings(HTTP_OK)
-        def test_extract_sends_an_encodable_url(self, path):
+        def test_extract_sends_an_exact_encodable_url(self, path):
             mod = load(self.base)
             url = f"https://example.invalid/{path}"
             out = mod.DeepSeekWebSearchProvider().extract([url])
             self.assertEqual(len(out), 1)
             self.assertEqual(out[0]["url"], mod._utf8_safe(url))
-            json.loads(Handler.seen[-1]["body"].decode("utf-8"))["url"].encode("utf-8")
+            sent = json.loads(Handler.seen[-1]["body"].decode("utf-8"))["url"]
+            self.assertEqual(sent, out[0]["url"])
+            sent.encode("utf-8")
 
         @given(st.integers())
         @settings(HTTP_OK)
@@ -217,24 +255,28 @@ if HAVE_HYPOTHESIS:
 
         @given(st.lists(st.tuples(ANY_TEXT, ANY_TEXT), max_size=4))
         @settings(HTTP_OK)
-        def test_response_text_is_mapped_verbatim(self, rows):
+        def test_response_text_is_made_utf8_safe(self, rows):
             results = [
                 {"title": title, "url": f"https://x.invalid/{i}", "summary": summary}
                 for i, (title, summary) in enumerate(rows)
             ]
             Handler.payload = json.dumps({"results": results}, ensure_ascii=True).encode()
-            out = load(self.base).DeepSeekWebSearchProvider().search("q", limit=3)
+            mod = load(self.base)
+            out = mod.DeepSeekWebSearchProvider().search("q", limit=3)
             self.assertTrue(out["success"], out)
             web = out["data"]["web"]
-            self.assertEqual([h["title"] for h in web], [r["title"] for r in results])
-            self.assertEqual([h["description"] for h in web], [r["summary"] for r in results])
+            self.assertEqual([h["title"] for h in web], [mod._utf8_safe(r["title"]) for r in results])
+            self.assertEqual([h["description"] for h in web],
+                             [mod._utf8_safe(r["summary"]) for r in results])
             self.assertEqual([h["position"] for h in web], list(range(1, len(results) + 1)))
+            json.dumps(web, ensure_ascii=False).encode("utf-8")
 
 else:  # pragma: no cover - exercised under the Hermes venv, which has no hypothesis
     class TestUnicodeInvariants(unittest.TestCase):
-        @unittest.skip("hypothesis not installed — dev extra: requirements-dev.txt")
-        def test_property_tier_skipped(self):
-            pass
+        def test_property_tier_is_required_when_asked(self):
+            if os.environ.get("REQUIRE_HYPOTHESIS") == "1":
+                self.fail("hypothesis is required in this tier; install requirements-dev.txt")
+            self.skipTest("hypothesis not installed — dev extra: requirements-dev.txt")
 
 
 if __name__ == "__main__":

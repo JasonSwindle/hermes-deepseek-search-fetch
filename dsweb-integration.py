@@ -34,14 +34,37 @@ import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 REPO = "JasonSwindle/hermes-deepseek-search-fetch"
 PLUGIN_ID = "deepseek-search-fetch"
 ESCAPED = "\\# Heading\\n\\[link\\]\\(https\\:\\/\\/example\\.com\\) \\| a \\| b \\|"
+# What the plugin must return after the fetch endpoint's uniform backslash
+# escaping is reversed. The literal `\n` is a *letter* escape, so the unescaper
+# must leave it alone — this string pins that too. Asserting the exact string,
+# not substrings, is what makes this check able to fail.
+UNESCAPED = "# Heading\\n[link](https://example.com) | a | b |"
+EXPECTED_CHECKS = 22
 
 RESULTS: list[tuple[str, bool, str]] = []
 SEEN: list[dict] = []
 ATTEMPTS: dict[str, int] = {}
+
+
+def _default_hermes_source() -> str:
+    """The Hermes source tree to import the tools from.
+
+    ``--hermes`` is the CLI binary; this is the checkout/source tree. macOS and
+    per-user installs live under ~/.hermes/hermes-agent, Linux images often use
+    /opt/hermes. HERMES_SOURCE overrides both.
+    """
+    env = os.environ.get("HERMES_SOURCE")
+    if env:
+        return env
+    for candidate in (Path.home() / ".hermes" / "hermes-agent", Path("/opt/hermes")):
+        if (candidate / "agent" / "web_search_provider.py").is_file():
+            return str(candidate)
+    return "/opt/hermes"
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
@@ -121,14 +144,18 @@ def main() -> int:
                         help="path to the hermes CLI (default: the one on PATH)")
     parser.add_argument("--install", metavar="SHA",
                         help="install the plugin from GitHub pinned at this 40-character sha first")
-    parser.add_argument("--hermes-source", default="/opt/hermes",
-                        help="Hermes source tree to import the tools from (default: /opt/hermes)")
+    parser.add_argument("--hermes-source", default=_default_hermes_source(),
+                        help="Hermes source tree to import tools from (default: $HERMES_SOURCE, "
+                             "~/.hermes/hermes-agent, then /opt/hermes)")
     args = parser.parse_args()
 
     hermes = args.hermes or shutil.which("hermes")
     if not hermes:
         raise SystemExit("could not find the hermes CLI on PATH; pass --hermes /path/to/hermes")
     args.hermes = hermes
+    if not (Path(args.hermes_source) / "agent" / "web_search_provider.py").is_file():
+        raise SystemExit(f"--hermes-source {args.hermes_source!r} is not a Hermes source tree; "
+                         "pass the checkout, not the CLI binary")
 
     home = os.path.abspath(args.hermes_home)
     env = {**os.environ, "HERMES_HOME": home}
@@ -150,6 +177,9 @@ def main() -> int:
     installed = os.path.join(home, "plugins", PLUGIN_ID)
     if not os.path.isdir(installed):
         raise SystemExit(f"no plugin at {installed} — pass --install <sha> into a fresh --hermes-home")
+    if not args.install:
+        print(f"NOTE: testing the plugin already installed at {installed}; "
+              "use --install <sha> for a clean pinned install\n")
 
     port = _free_port()
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
@@ -169,6 +199,8 @@ def main() -> int:
     cfg("set", "web.keyless_rescue", "false")
 
     from tools.web_tools import web_extract_tool, web_search_tool  # noqa: PLC0415
+    from agent.web_search_provider import WebSearchProvider  # noqa: PLC0415
+    from agent.web_search_registry import get_provider  # noqa: PLC0415
 
     def search(query: str, limit: int = 2) -> dict:
         SEEN.clear()
@@ -189,15 +221,25 @@ def main() -> int:
     check("content is mapped when the vendor returns it",
           bool(hits) and hits[0].get("content") == "# Doc 0", json.dumps(hits[:1]))
 
+    provider = get_provider("deepseek")
+    check("the registered provider subclasses the real ABC", isinstance(provider, WebSearchProvider),
+          repr(provider))
+    schema = provider.get_setup_schema() if provider is not None else {}
+    check("the setup schema has the picker's shape",
+          set(schema) >= {"name", "badge", "tag", "env_vars"}, json.dumps(schema)[:200])
+
     setting("need_content", "false")
-    search("setting off")
+    off = search("setting off")
     body = SEEN[-1]["body"] if SEEN else {}
-    check("setting need_content=false keeps the wire clean", "need_content" not in body, json.dumps(body))
+    check("setting need_content=false keeps the wire clean",
+          off.get("success") is True and bool(SEEN) and "need_content" not in body, json.dumps(body))
 
     setting("localization", "203.0.113.7")
-    search("localised")
+    localised = search("localised")
     body = SEEN[-1]["body"] if SEEN else {}
-    check("localization reaches the wire", body.get("localization") == "203.0.113.7", json.dumps(body))
+    check("localization reaches the wire",
+          localised.get("success") is True and body.get("localization") == "203.0.113.7",
+          json.dumps(body))
     setting("localization", "")
 
     ATTEMPTS.clear()
@@ -220,13 +262,16 @@ def main() -> int:
     check("extract returns both pages in order",
           [page.get("url") for page in pages] == ["https://example.com/a", "https://example.com/b"],
           json.dumps(pages)[:300])
-    if pages:
-        check("content is unescaped", "\\#" not in (pages[0].get("content") or ""),
-              repr(pages[0].get("content"))[:200])
-        check("raw_content is unescaped too", "\\#" not in (pages[0].get("raw_content") or ""),
-              repr(pages[0].get("raw_content"))[:200])
-        check("markdown structure survives", "# Heading" in (pages[0].get("content") or ""),
-              repr(pages[0].get("content"))[:200])
+    first = pages[0] if pages else {}
+    # `raw_content` is asserted at the provider level (unit/live tiers): the
+    # dispatcher's _trim_results deliberately drops it before the tool returns,
+    # so checking it here would pass on None.
+    check("content is exactly the unescaped Markdown",
+          first.get("content") == UNESCAPED, repr(first.get("content"))[:200])
+    check("markdown structure survives",
+          "# Heading" in (first.get("content") or "")
+          and "[link](https://example.com)" in (first.get("content") or ""),
+          repr(first.get("content"))[:200])
 
     out = json.loads(asyncio.run(web_extract_tool(["https://example.com/ok", "https://example.com/boom"])))
     pages = out.get("results", out.get("data")) or []
@@ -236,6 +281,17 @@ def main() -> int:
           json.dumps(pages)[:300])
     check("the failed page carries an error", bool(bad_page) and bool(bad_page[0].get("error")),
           json.dumps(pages)[:300])
+
+    # Error-first: a provider that breaks out of the loop on the first failure
+    # must fail this, unlike the ok-first batch above.
+    out = json.loads(asyncio.run(web_extract_tool(["https://example.com/boom", "https://example.com/ok"])))
+    pages = out.get("results", out.get("data")) or []
+    ok_page = [page for page in pages if page.get("url") == "https://example.com/ok"]
+    check("an error-first batch still returns every page",
+          [page.get("url") for page in pages] == ["https://example.com/boom", "https://example.com/ok"],
+          json.dumps(pages)[:300])
+    check("an error-first batch still fetches the later page",
+          bool(ok_page) and ok_page[0].get("content") == UNESCAPED, json.dumps(pages)[:300])
 
     # The README's caveat, measured instead of asserted: with Hermes' search memo on, a query answered
     # before a settings flip is served from cache, in its old shape, until the TTL expires.
@@ -248,11 +304,16 @@ def main() -> int:
     check("memo: the cached search is served without a second request",
           ATTEMPTS.get("/v1/tools/search") == 1, f"attempts={ATTEMPTS.get('/v1/tools/search')}")
     check("memo: the stale entry keeps its old shape (no content after the flip)",
-          "content" not in json.dumps(second.get("data", {})), json.dumps(second)[:200])
+          second.get("success") is True and "content" not in json.dumps(second.get("data", {})),
+          json.dumps(second)[:200])
 
     server.shutdown()
+    server.server_close()
     failed = [name for name, ok, _ in RESULTS if not ok]
-    print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
+    if len(RESULTS) != EXPECTED_CHECKS:
+        failed.append(f"check count {len(RESULTS)} != {EXPECTED_CHECKS}")
+    passed = len(RESULTS) - len([n for n, ok, _ in RESULTS if not ok])
+    print(f"\n{passed}/{len(RESULTS)} checks passed")
     if failed:
         print("FAILED: " + ", ".join(failed))
     return 1 if failed else 0

@@ -2,18 +2,24 @@
 
 Routes Hermes' web_search / web_extract tools through DeepSeek's Search & Fetch
 tools APIs: POST https://api.deepseek.com/v1/tools/search and /v1/tools/fetch.
-Billing: $0.75 / 1,000 successful requests (failures and empty results free);
-5 QPS. Key: DEEPSEEK_API_KEY (declared in plugin.yaml requires_env).
+Billing: $0.75 / 1,000 successful requests (failures and empty results free).
+Rate limits: the guide lists 100 QPS for Search and 25 QPS for Fetch per
+account (Fetch also has a per-domain cap); a live 429 has reported a current
+QPS of 5, so treat the effective ceiling as account-dependent. Key:
+DEEPSEEK_API_KEY (declared in plugin.yaml requires_env).
 
 Self-contained on purpose: the bundled helpers (plugins/web/_common.py) are
 internal to the shipped tree; a user plugin imports only agent.web_search_provider
-and httpx (both guaranteed present — every sibling provider uses httpx).
+and httpx (both guaranteed present — every sibling provider uses httpx). The one
+exception is a guarded, lazy read of Hermes' public hermes_cli.config for
+web.extract_timeout, so this plugin can keep its batch inside Hermes' cap.
 """
 from __future__ import annotations
 
 import ipaddress
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -29,9 +35,11 @@ logger = logging.getLogger(__name__)
 
 # DEEPSEEK_BASE_URL exists so the test suite can point the provider at a local
 # mock server. It is validated rather than trusted: an override may only be the
-# real endpoint over https, or a loopback test host. Anything else is refused
-# with a warning and the default endpoint is used — a freely redirectable base
-# URL would send the bearer key wherever whoever controls the environment chose.
+# exact endpoint over https (no path, query, fragment, non-443 port or
+# userinfo), or a loopback test host. Anything else — including a value
+# urlsplit cannot parse — is refused with a warning and the default endpoint is
+# used. The warning never repeats the raw value: a rejected override can carry
+# userinfo or a proxy credential, and logs are shared.
 _DEFAULT_BASE = "https://api.deepseek.com"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -40,16 +48,26 @@ def _safe_base() -> str:
     raw = (os.environ.get("DEEPSEEK_BASE_URL") or "").strip().rstrip("/")
     if not raw:
         return _DEFAULT_BASE
-    parsed = urlsplit(raw)
-    host = (parsed.hostname or "").lower()
+    try:
+        parsed = urlsplit(raw)
+        host = (parsed.hostname or "").lower()
+    except (ValueError, UnicodeError):
+        logger.warning("ignoring malformed DEEPSEEK_BASE_URL; using %s", _DEFAULT_BASE)
+        return _DEFAULT_BASE
     no_userinfo = not (parsed.username or parsed.password)
     if no_userinfo and host == "api.deepseek.com" and parsed.scheme == "https":
-        return raw
+        try:
+            port = parsed.port
+        except ValueError:
+            port = -1
+        if port in (None, 443) and parsed.path in ("", "/") and not parsed.query and not parsed.fragment:
+            return _DEFAULT_BASE
     if no_userinfo and host in _LOOPBACK_HOSTS and parsed.scheme in {"http", "https"}:
         return raw
     logger.warning(
-        "ignoring DEEPSEEK_BASE_URL=%r: only https://api.deepseek.com or a loopback test "
-        "host is accepted; using %s", raw[:120], _DEFAULT_BASE,
+        "ignoring DEEPSEEK_BASE_URL (scheme=%r host=%r): only https://api.deepseek.com "
+        "or a loopback test host is accepted; using %s",
+        parsed.scheme or "", host or "", _DEFAULT_BASE,
     )
     return _DEFAULT_BASE
 
@@ -62,24 +80,26 @@ _SEARCH_LIMIT_CAP = 50  # DeepSeek count: 1-50
 
 # Search & Fetch are read-only, and the vendor's rule for them is specific:
 # wait and retry HTTP 408, 429 and 5xx; top up on 402; send every other 4xx
-# once. The wait is per call. Search and Fetch have separate 5 QPS account
-# caps, Fetch adds a per-domain cap, and other processes on the account are
-# invisible here, so a queue in this process would not be the account's limit.
-# Two quick retries clear a one-second QPS bucket.
+# once. The wait is per call. The guide lists 100 QPS for Search and 25 QPS for
+# Fetch per account, and Fetch also has a per-domain cap; a live 429 has
+# reported a current QPS of 5, so the effective ceiling is account-dependent.
+# Other processes on the account are invisible here, so a queue in this process
+# would not be the account's limit. Two quick retries clear a one-second bucket.
 #
 # The 40s budget bounds the CALL, not just the wait: a retry is only scheduled
 # when the attempt it schedules still fits inside the budget, so a slow call
 # cannot spend a third 30s attempt past it.
 #
-# Extract walks URLs one by one, and Hermes abandons the whole batch at 120s —
-# pages already fetched included. Two things keep the batch inside that cap.
-# httpx timeouts are per connect/read, NOT wall-clock: a body that trickles in
-# fast enough to reset the read timer outlives _TIMEOUT, so a deadline that
-# gated only the start of an attempt would bound nothing. Each attempt gets
-# only the time the deadline has left, capped at _TIMEOUT, and the batch stops
-# starting requests at the deadline — worst case deadline + _REQUEST_FLOOR_S.
-# The limit is the length of the backoff list, so adding a wait cannot
-# index off the end of the tuple.
+# Extract walks URLs one by one, and Hermes abandons the whole batch at its
+# web.extract_timeout (120s by default) — pages already fetched included. A
+# wall-clock deadline is what keeps the batch inside that cap: httpx timeouts
+# are per connect/read, NOT wall-clock, so a body that trickles in fast enough
+# to reset the read timer outlives the nominal timeout. _request therefore
+# streams the body and checks _monotonic() between chunks, aborting at the
+# attempt deadline; _extract_deadline additionally clamps the batch deadline
+# below web.extract_timeout when it can read it. Worst case is the batch
+# deadline plus _REQUEST_FLOOR_S. The limit is the length of the backoff list,
+# so adding a wait cannot index off the end of the tuple.
 _RETRY_BACKOFF_S = (1.0, 2.0)
 _RETRY_LIMIT = len(_RETRY_BACKOFF_S)
 _RETRY_JITTER_S = 0.25
@@ -87,12 +107,18 @@ _RETRY_BUDGET_S = 40.0
 _REQUEST_FLOOR_S = 0.5
 # 110 plus the 0.5s floor sits inside Hermes' default 120s cap with room for the
 # thread hop, and leaves the rest of the window to pages that would otherwise
-# never be started. Lower it when web.extract_timeout is lowered — the plugin
-# cannot read that setting, so the two numbers have to be kept in step by hand.
+# never be started. _extract_deadline additionally clamps this below
+# web.extract_timeout when it can read it; the setting remains an upper bound.
 _EXTRACT_DEADLINE_S = 110.0
 _EXTRACT_DEADLINE_SETTING = "extract_deadline"
 _EXTRACT_DEADLINE_MIN_S = 5.0
 _EXTRACT_DEADLINE_MAX_S = 115.0
+# Effective batch deadline = min(setting, web.extract_timeout - this margin), so
+# one in-flight attempt plus the floor still fits Hermes' cap.
+_EXTRACT_TIMEOUT_MARGIN_S = 1.5
+# A hostile or broken response cannot make one call allocate without bound.
+_BODY_LIMIT_BYTES = 16 * 1024 * 1024
+_READ_FLOOR_S = 0.1
 _BATCH_DEADLINE = "batch deadline reached"
 _DETAIL_CAP = 300
 _TOP_UP = "Top up the DeepSeek account before retrying."
@@ -125,10 +151,12 @@ def _unescape_markdown(text: str) -> str:
 
 # Search returns metadata only unless the API is asked for page content. Setting
 # `need_content` makes every result carry its page text as clean Markdown — and
-# costs 2-5 KB per result, straight into the tool result and the context window.
-# So it is opt-in, from the plugin's own setting (Desktop plugin form, or
-# `hermes plugins manage settings`), or — for hosts with no settings surface —
-# from DEEPSEEK_SEARCH_NEED_CONTENT=1 (or true/yes/on).
+# costs kilobytes per result, straight into the tool result and the context
+# window (a live run measured 20,176 characters for one hit). So it is opt-in,
+# from the plugin's own setting (Desktop/TUI plugin settings, or the terminal
+# `hermes config set plugins.entries.<id>.settings.need_content true`), or — for
+# an unset setting, or a host with no settings surface — from
+# DEEPSEEK_SEARCH_NEED_CONTENT=1 (or true/yes/on).
 _NEED_CONTENT_ENV = "DEEPSEEK_SEARCH_NEED_CONTENT"
 _NEED_CONTENT_SETTING = "need_content"
 _LOCALIZATION_SETTING = "localization"
@@ -149,14 +177,15 @@ def _need_content_enabled(get_setting=None) -> bool:
 
     The plugin setting wins when it holds a boolean: a box ticked in the UI is
     a deliberate choice, and an ambient environment variable must not override
-    it. An unset setting falls through to the environment. Any failure to read
-    either counts as "off" — a capability must never fail over a preference.
+    it. An unset setting falls through to the environment. A read that fails is
+    "off", never the environment and never an exception: a capability must not
+    fail open over a preference.
     """
     if get_setting is not None:
         try:
             value = get_setting(_NEED_CONTENT_SETTING)
         except Exception:  # never raise out of a capability
-            return _env_need_content()
+            return False
         if isinstance(value, bool):
             return value
     return _env_need_content()
@@ -189,22 +218,63 @@ def _localization(get_setting=None) -> str:
     return value
 
 
+def _hermes_extract_timeout() -> float | None:
+    """Hermes' ``web.extract_timeout`` when it can be read, else ``None``.
+
+    ``hermes_cli.config`` is a documented public module, so this does not widen
+    the plugin's private-import surface. Any failure — an older Hermes, a
+    missing function, a broken config — is simply "not readable", and the
+    extract_deadline setting/default stands alone.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        web = (load_config_readonly() or {}).get("web") or {}
+        value = web.get("extract_timeout")
+    except Exception:  # never raise out of a capability
+        return None
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if math.isfinite(number) and number > 0:
+        return number
+    return None
+
+
 def _extract_deadline(get_setting=None) -> float:
     """Seconds one ``extract()`` may spend starting requests.
 
-    A setting exists because the number has to be kept below Hermes'
-    ``web.extract_timeout`` (120 by default) and the plugin cannot read that
-    setting — it is not plugin-scoped. Anything unusable falls back to the
-    built-in value, clamped, so a bad setting can never uncap the batch.
+    The setting/default is clamped to 5-115, then clamped again below Hermes'
+    ``web.extract_timeout`` (minus a margin) when that public setting is
+    readable. Anything unusable — NaN, infinity, an overflowing integer, a
+    failed settings read — falls back to the built-in value, so a bad setting
+    can never uncap the batch or raise out of ``extract()``.
     """
+    value: Any = None
     if get_setting is not None:
         try:
             value = get_setting(_EXTRACT_DEADLINE_SETTING)
         except Exception:  # never raise out of a capability
             value = None
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return min(max(float(value), _EXTRACT_DEADLINE_MIN_S), _EXTRACT_DEADLINE_MAX_S)
-    return _EXTRACT_DEADLINE_S
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            deadline = float(value)
+        except (OverflowError, ValueError):
+            deadline = _EXTRACT_DEADLINE_MAX_S
+        if math.isnan(deadline):
+            deadline = _EXTRACT_DEADLINE_S
+        elif math.isinf(deadline):
+            deadline = _EXTRACT_DEADLINE_MAX_S if deadline > 0 else _EXTRACT_DEADLINE_MIN_S
+    else:
+        deadline = _EXTRACT_DEADLINE_S
+    deadline = min(max(deadline, _EXTRACT_DEADLINE_MIN_S), _EXTRACT_DEADLINE_MAX_S)
+    web_timeout = _hermes_extract_timeout()
+    if web_timeout is not None:
+        deadline = min(deadline, max(_EXTRACT_DEADLINE_MIN_S, web_timeout - _EXTRACT_TIMEOUT_MARGIN_S))
+    return deadline
 
 
 def _missing_key_error() -> str:
@@ -212,6 +282,41 @@ def _missing_key_error() -> str:
         "DEEPSEEK_API_KEY is not set. Add it for the deepseek-search-fetch plugin "
         "(hermes tools -> Web Search) or unset the DeepSeek web backend."
     )
+
+
+def _api_key() -> str:
+    """The bearer key through Hermes' provider helper, or "".
+
+    Hermes raises ``UnscopedSecretError`` under profile multiplexing when no
+    profile scope is bound; a capability must turn that refusal into a normal
+    unavailable/error path, not an exception. Never falls back to another
+    profile's environment value.
+    """
+    try:
+        value = get_provider_env("DEEPSEEK_API_KEY")
+    except Exception:  # never raise out of a capability
+        return ""
+    return (value or "").strip() if isinstance(value, str) else ""
+
+
+def _text(value: Any, default: str = "") -> str:
+    """A response string made UTF-8-encodable; non-strings become *default*."""
+    return _utf8_safe(value) if isinstance(value, str) else default
+
+
+def _optional_text(value: Any) -> str | None:
+    """A nullable response string made UTF-8-encodable; other types become None."""
+    return _utf8_safe(value) if isinstance(value, str) else None
+
+
+def _coerce_urls(urls: Any) -> list[Any]:
+    """A bare string is one URL, a non-iterable is one entry, never a raise."""
+    if isinstance(urls, str):
+        return [urls]
+    try:
+        return list(urls)
+    except TypeError:
+        return [urls]
 
 
 def _is_retryable(status: int) -> bool:
@@ -294,8 +399,46 @@ def _request(
     payload: dict[str, Any],
     headers: dict[str, str],
     timeout: float = _TIMEOUT,
+    deadline: float | None = None,
 ) -> httpx.Response:
-    return httpx.post(url, json=payload, headers=headers, timeout=timeout)
+    """POST and read the body under a real wall-clock deadline.
+
+    httpx timeouts are per connect/read, not wall-clock: a server that sends a
+    byte before every read timeout renews the timer forever. Streaming the body
+    and checking ``_monotonic()`` between chunks is what actually bounds the
+    call; the per-read timeout still catches a silent stall. The collected body
+    is rebuilt as an ``httpx.Response`` so the caller's status/text/json()
+    handling is unchanged.
+    """
+    now = _monotonic()
+    if deadline is None:
+        deadline = now + timeout
+    read_timeout = max(_READ_FLOOR_S, min(timeout, deadline - now))
+    chunks: list[bytes] = []
+    size = 0
+    with httpx.Client(timeout=httpx.Timeout(read_timeout)) as client:
+        with client.stream("POST", url, json=payload, headers=headers) as resp:
+            for chunk in resp.iter_bytes():
+                if chunk:
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size > _BODY_LIMIT_BYTES:
+                        raise httpx.ReadTimeout("response body exceeded the limit")
+                if _monotonic() >= deadline:
+                    raise httpx.ReadTimeout("response exceeded the deadline")
+            # ``iter_bytes`` has already decoded Content-Encoding, so the
+            # reconstructed response must not advertise an encoding: httpx's
+            # Response.__init__ would otherwise decode the decoded bytes again
+            # (live: "Error -3 while decompressing data"). Drop the framing
+            # headers too; httpx recomputes Content-Length from the body.
+            framing = {"content-encoding", "content-length", "transfer-encoding"}
+            headers = [(key, value) for key, value in resp.headers.items()
+                       if key.lower() not in framing]
+            return httpx.Response(
+                resp.status_code,
+                headers=headers,
+                content=b"".join(chunks),
+            )
 
 
 def _status_error(resp: httpx.Response, retries: int) -> RuntimeError:
@@ -329,7 +472,7 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
         return "DeepSeek"
 
     def is_available(self) -> bool:
-        return bool(get_provider_env("DEEPSEEK_API_KEY"))
+        return bool(_api_key())
 
     def supports_search(self) -> bool:
         return True
@@ -343,6 +486,9 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
         payload: dict[str, Any],
         deadline: float | None = None,
     ) -> dict[str, Any]:
+        api_key = _api_key()
+        if not api_key:
+            raise RuntimeError(_missing_key_error())
         started = _monotonic()
         retries = 0
         # The last response, so a deadline that arrives before the next send
@@ -355,23 +501,27 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
                 raise _status_error(held, retries)
             attempt_timeout = _TIMEOUT
             if deadline is not None:
-                # httpx timeouts are per connect/read, not wall-clock: give the
-                # attempt only what the deadline has left, or a body that trickles
-                # in fast enough to reset the read timer outlives both.
+                # Leave the attempt only what the batch has left, capped at
+                # _TIMEOUT. _request's wall-clock check enforces it even when a
+                # trickling body keeps resetting httpx's per-read timer.
                 attempt_timeout = min(_TIMEOUT, max(_REQUEST_FLOOR_S, deadline - _monotonic()))
+            attempt_deadline = _monotonic() + attempt_timeout
+            if deadline is not None:
+                attempt_deadline = min(attempt_deadline, deadline)
             try:
                 resp = _request(
                     url,
                     payload,
                     {
-                        "Authorization": f"Bearer {get_provider_env('DEEPSEEK_API_KEY')}",
+                        "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                     },
                     timeout=attempt_timeout,
+                    deadline=attempt_deadline,
                 )
             except httpx.TransportError as exc:
                 # A dropped connection is not one of the documented statuses.
-                # Retrying it spends the 30s timeout again. Once a retry has
+                # Retrying it spends the attempt timeout again. Once a retry has
                 # already happened, keep that count on the error Hermes sees.
                 if retries == 0:
                     raise
@@ -427,28 +577,38 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
             if localization:
                 payload["localization"] = localization
             data = self._post(_SEARCH_URL, payload)
-            rows = data.get("results") or []
+            if not isinstance(data, dict):
+                raise RuntimeError(f"unexpected response shape: {type(data).__name__}")
+            rows = data.get("results")
+            if rows is None:
+                rows = []
+            if not isinstance(rows, list):
+                raise RuntimeError(f"unexpected results shape: {type(rows).__name__}")
             hits: list[dict[str, Any]] = []
-            for i, r in enumerate(rows):
+            for r in rows:
+                if not isinstance(r, dict):
+                    logger.warning("skipping malformed search result (%s)", type(r).__name__)
+                    continue
                 hit: dict[str, Any] = {
-                    "title": r.get("title") or "",
-                    "url": r.get("url") or "",
-                    "description": r.get("summary") or r.get("snippet") or "",
-                    "position": i + 1,
+                    "title": _text(r.get("title")),
+                    "url": _text(r.get("url")),
+                    "description": _text(r.get("summary") or r.get("snippet")),
+                    "position": len(hits) + 1,
                     # Quality, freshness and provenance signals, so a caller can
                     # filter or attribute a result set without paying to fetch
                     # it. None when the vendor omits them — the keys are always
                     # present.
                     "rerank_score": r.get("rerank_score"),
                     "authority": r.get("authority"),
-                    "date": r.get("date"),
-                    "site_name": r.get("site_name"),
-                    "site_icon": r.get("site_icon"),
+                    "date": _optional_text(r.get("date")),
+                    "site_name": _optional_text(r.get("site_name")),
+                    "site_icon": _optional_text(r.get("site_icon")),
                 }
                 if want_content:
                     # The search endpoint returns page text as clean Markdown —
-                    # no backslash escaping, unlike the fetch endpoint.
-                    hit["content"] = r.get("content") or ""
+                    # no backslash escaping, unlike the fetch endpoint. A live
+                    # run measured zero escapes (issue #2), so do not unescape.
+                    hit["content"] = _text(r.get("content"))
                 hits.append(hit)
             return {"success": True, "data": {"web": hits}}
         except Exception as exc:  # never raise out of a capability
@@ -458,7 +618,9 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
     def extract(self, urls: list[str], **kwargs: Any) -> list[dict[str, Any]]:
         # DeepSeek's fetch endpoint is single-URL; fetch sequentially.
         # Unknown kwargs (format, include_raw, ...) are ignored per the contract.
-        urls = [_utf8_safe(u) if isinstance(u, str) else u for u in urls]
+        # A bare string is one URL, and a non-iterable is one entry: this method
+        # must never raise out of a capability, even when a caller gets it wrong.
+        urls = [_utf8_safe(u) if isinstance(u, str) else u for u in _coerce_urls(urls)]
         if not self.is_available():
             err = _missing_key_error()
             return [{"url": u, "title": "", "content": "", "error": err} for u in urls]
@@ -467,13 +629,15 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
         for url in urls:
             try:
                 data = self._post(_FETCH_URL, {"url": url}, deadline)
-                title = data.get("title") or ""
+                if not isinstance(data, dict):
+                    raise RuntimeError(f"unexpected response shape: {type(data).__name__}")
+                title = _text(data.get("title"))
                 # Both fields hold the unescaped Markdown on purpose: Hermes
                 # prefers raw_content when it derives the model-visible content
                 # and when it writes its extract cache, so leaving the vendor's
                 # escaping in raw_content would reintroduce it in every cached
                 # and budgeted result.
-                content = _unescape_markdown(data.get("content") or "")
+                content = _utf8_safe(_unescape_markdown(_text(data.get("content"))))
                 out.append(
                     {
                         "url": url,
@@ -509,8 +673,9 @@ def register(ctx) -> None:
     # The settings surface (plugins.entries.<id>.settings) is what makes
     # `need_content` live: the reader is called per search, and Hermes' config
     # cache is file-signature keyed, so a settings change lands on the next
-    # search without restarting the session. On a host that predates it there is
-    # no get_config, and the provider falls back to the environment variable.
+    # search without restarting the session. The manifest declares
+    # requires_hermes >=0.22.0, so a supported host has this surface; the code
+    # still tolerates its absence for direct imports and the validation probe.
     reader = getattr(ctx, "get_config", None)
-    get_setting = (lambda key: reader(key, default=None)) if reader is not None else None
+    get_setting = (lambda key: reader(key, default=None)) if callable(reader) else None
     ctx.register_web_search_provider(DeepSeekWebSearchProvider(get_setting))

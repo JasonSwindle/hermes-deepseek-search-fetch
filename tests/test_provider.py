@@ -19,11 +19,13 @@ tier, `dsweb-integration.py` at the repo root — it installs the plugin into a
 throwaway HERMES_HOME through `hermes plugins install --ref <sha>`, points it at
 a loopback mock and drives the real `web_search` / `web_extract` dispatcher.
 """
+import gzip
 import importlib.util
 import json
 import os
 import sys
 import threading
+import time
 import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -110,8 +112,13 @@ def fast_clock(mod, advance: float = 0.0):
         state["now"] += seconds
 
     def request(url, payload, headers, **kwargs):
-        state["now"] += advance
-        return real_request(url, payload, headers, **kwargs)
+        # Advance *after* the request: the production deadline check runs while
+        # the body is being read, so pretending the delay happened before the
+        # send would make every simulated-attempt test hit that deadline.
+        try:
+            return real_request(url, payload, headers, **kwargs)
+        finally:
+            state["now"] += advance
 
     mod._monotonic = monotonic
     mod._sleep = sleep
@@ -194,14 +201,67 @@ class Handler(BaseHTTPRequestHandler):
                  "site_name": "Example News", "site_icon": "https://example.invalid/favicon.ico"},
                 {"title": "Thin", "url": "https://example.invalid/r2", "snippet": "S2"},
             ]})
+        if prefix.startswith("/shape_nullbody"):
+            return self._send_raw(200, b"null")
         if prefix.startswith("/shape_null"):
             return self._send(200, {"results": None})
         if prefix.startswith("/shape_str"):
             return self._send(200, {"results": "notalist"})
         if prefix.startswith("/shape_list"):
             return self._send(200, {"results": ["oops", 42, None]})
+        if prefix.startswith("/shape_mixed"):
+            return self._send(200, {"results": [
+                {"title": "Good", "url": "https://example.invalid/good", "summary": "ok"},
+                "oops",
+            ]})
+        if prefix.startswith("/shape_empty"):
+            return self._send(200, {"results": [{}]})
         if prefix.startswith("/shape_toplist"):
             return self._send_raw(200, json.dumps([1, 2, 3]).encode())
+        if prefix.startswith("/body_surrogate"):
+            return self._send(200, {"results": [
+                {"title": "a\ud800", "url": "https://example.invalid/s",
+                 "summary": "b\ud800", "content": "c\ud800"},
+            ]})
+        if prefix.startswith("/body_escaped"):
+            return self._send(200, {"results": [
+                {"title": "Esc", "url": "https://example.invalid/e",
+                 "summary": "escaped", "content": "\\d+ digits, C:\\path"},
+            ]})
+        if prefix.startswith("/fetch_surrogate"):
+            return self._send(200, {"title": "a\ud800", "content": "b\ud800"})
+        if prefix.startswith("/gzip"):
+            payload = json.dumps({"results": [
+                {"title": "Gzipped", "url": "https://example.invalid/gz", "summary": "gz"},
+            ]}).encode()
+            compressed = gzip.compress(payload)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(compressed)))
+            self.end_headers()
+            self.wfile.write(compressed)
+            return
+        if prefix.startswith("/mixed"):
+            if self.path.endswith(_FETCH):
+                request_body = json.loads(body.decode("utf-8") or "{}")
+                if "boom" in str(request_body.get("url", "")):
+                    return self._send(500, {"error": {"message": "boom"}})
+                return self._send_raw(200, type(self).fetch_body)
+            return self._send_raw(200, type(self).search_body)
+        if prefix.startswith("/trickle"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "1000")
+            self.end_headers()
+            for _ in range(100):
+                try:
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                time.sleep(0.05)
+            return
         if self.path.endswith(_FETCH):
             return self._send_raw(200, type(self).fetch_body)
         return self._send_raw(200, type(self).search_body)
@@ -501,11 +561,23 @@ class TestSearchContract(MockVendor):
         self.assertEqual(out["data"]["web"], [])
 
     def test_hostile_shapes_are_graceful(self):
-        for name, prefix in (("list", "/shape_list"), ("str", "/shape_str"), ("toplist", "/shape_toplist")):
+        # A list of non-dict rows is skipped row by row, so the call is still a
+        # success with no hits. A non-list `results` or non-dict top level is a
+        # clear error, not an AttributeError.
+        out = provider("s_list", f"{self.base}/shape_list").search("q")
+        self.assertTrue(out["success"])
+        self.assertEqual(out["data"]["web"], [])
+        for name, prefix in (("str", "/shape_str"), ("toplist", "/shape_toplist")):
             with self.subTest(shape=name):
                 out = provider(f"s_{name}", f"{self.base}{prefix}").search("q")
                 self.assertFalse(out["success"])
-                self.assertTrue(out["error"])
+                self.assertIn("DeepSeek search failed:", out["error"])
+
+    def test_a_malformed_row_does_not_discard_good_hits(self):
+        out = provider("s_mixed", f"{self.base}/shape_mixed").search("q")
+        self.assertTrue(out["success"], out)
+        self.assertEqual([hit["title"] for hit in out["data"]["web"]], ["Good"])
+        self.assertEqual(out["data"]["web"][0]["position"], 1)
 
 
 # ── contract: extract ─────────────────────────────────────────────────────────
@@ -835,21 +907,22 @@ class TestErrorPaths(MockVendor):
                 self.assertLessEqual(deadline + mod._REQUEST_FLOOR_S, 120)
 
     def test_request_timeout_shrinks_towards_the_deadline(self):
-        """httpx timeouts are per read, so an attempt gets only what is left."""
+        """An attempt gets only the batch time left, down to the 5s minimum."""
         mod = load_plugin("deadline_shrink", f"{self.base}/ok")
-        mod.__dict__.update(_EXTRACT_DEADLINE_S=2.0)  # dynamic module; untyped on purpose
+        mod.__dict__.update(_EXTRACT_DEADLINE_S=5.0)  # dynamic module; untyped on purpose
+        mod._hermes_extract_timeout = lambda: None
         clock = fast_clock(mod)
         seen = []
 
-        def request(url, payload, headers, timeout=None):
+        def request(url, payload, headers, timeout=None, deadline=None):
             seen.append(timeout)
-            clock["now"] += 1.0
+            clock["now"] += 3.0
             return mod.httpx.Response(200, json={"title": "t", "content": "body"})
 
         mod._request = request
         urls = [f"https://example.invalid/{index}" for index in range(3)]
         out = mod.DeepSeekWebSearchProvider().extract(urls)
-        self.assertEqual(seen, [2.0, 1.0])
+        self.assertEqual(seen, [5.0, 2.0])
         self.assertNotIn("error", out[0])
         self.assertNotIn("error", out[1])
         self.assertIn("batch deadline", out[2]["error"])
@@ -954,6 +1027,506 @@ class TestProviderContract(MockVendor):
         self.assertIsInstance(out, list)
         self.assertTrue(all(isinstance(e, dict) for e in out))
         self.assertTrue({"url", "title", "content", "raw_content"} <= set(out[0]))
+
+
+# ── hardening: base URL, deadlines, key resolution, inputs, response text ─────
+class TestBaseUrlGuardHardening(unittest.TestCase):
+    ACCEPTED = [
+        ("https://api.deepseek.com:443", DEFAULT_BASE),
+        ("https://API.DEEPSEEK.COM", DEFAULT_BASE),
+    ]
+    REFUSED = [
+        "https://api.deepseek.com/evil",
+        "https://api.deepseek.com/v1",
+        "https://api.deepseek.com:8443",
+        "https://api.deepseek.com?x=1",
+        "https://api.deepseek.com#frag",
+        "https://api.deepseek.com:abc",
+        "http://[",
+        "http://[::1",
+        "https://evilapi.deepseek.com",
+        "https://user@api.deepseek.com",
+        "http://127.0.0.1.evil.example",
+        "http://0.0.0.0",
+    ]
+
+    def test_exact_origin_is_accepted_and_normalised(self):
+        for i, (value, expected) in enumerate(self.ACCEPTED):
+            with self.subTest(env=value):
+                self.assertEqual(load_plugin(f"guard_h_ok_{i}", value)._BASE, expected)
+
+    def test_path_port_query_fragment_and_malformed_are_refused(self):
+        for i, value in enumerate(self.REFUSED):
+            with self.subTest(env=value):
+                self.assertEqual(load_plugin(f"guard_h_no_{i}", value)._BASE, DEFAULT_BASE)
+
+    def test_malformed_override_warns_and_does_not_log_the_raw_value(self):
+        with self.assertLogs("guard_h_log", level="WARNING") as captured:
+            mod = load_plugin("guard_h_log", "https://user:secret@evil.example")
+        self.assertEqual(mod._BASE, DEFAULT_BASE)
+        output = "\n".join(captured.output)
+        self.assertIn("ignoring DEEPSEEK_BASE_URL", output)
+        self.assertNotIn("secret", output)
+        self.assertNotIn("user:", output)
+
+    def test_accepted_override_does_not_warn(self):
+        with self.assertNoLogs("guard_h_clean", level="WARNING"):
+            load_plugin("guard_h_clean", "https://api.deepseek.com")
+
+
+class TestDeadlineHardening(unittest.TestCase):
+    def _mod(self, name):
+        mod = load_plugin(name, None)
+        mod._hermes_extract_timeout = lambda: None
+        return mod
+
+    def test_nan_infinity_and_overflow_are_safe(self):
+        mod = self._mod("deadline_safe")
+        self.assertEqual(mod._extract_deadline(lambda _k: float("nan")), mod._EXTRACT_DEADLINE_S)
+        self.assertEqual(mod._extract_deadline(lambda _k: float("inf")), mod._EXTRACT_DEADLINE_MAX_S)
+        self.assertEqual(mod._extract_deadline(lambda _k: float("-inf")), mod._EXTRACT_DEADLINE_MIN_S)
+        self.assertEqual(mod._extract_deadline(lambda _k: 10**400), mod._EXTRACT_DEADLINE_MAX_S)
+        self.assertEqual(mod._extract_deadline(lambda _k: 42), 42.0)
+        self.assertEqual(mod._extract_deadline(lambda _k: True), mod._EXTRACT_DEADLINE_S)
+
+    def test_hermes_web_timeout_clamps_the_effective_deadline(self):
+        mod = self._mod("deadline_web")
+        mod._hermes_extract_timeout = lambda: 30.0
+        self.assertEqual(mod._extract_deadline(lambda _k: 90), 28.5)
+        self.assertEqual(mod._extract_deadline(None), 28.5)
+        mod._hermes_extract_timeout = lambda: 120.0
+        self.assertEqual(mod._extract_deadline(None), 110.0)
+
+    def test_a_nan_setting_still_uses_the_full_timeout(self):
+        mod = self._mod("deadline_nan_timeout")
+        p = mod.DeepSeekWebSearchProvider(lambda _k: float("nan"))
+        seen = []
+
+        def request(url, payload, headers, timeout=None, deadline=None):
+            seen.append(timeout)
+            return mod.httpx.Response(200, json={"title": "t", "content": "c"})
+
+        mod._request = request
+        out = p.extract(["https://example.invalid/x"])
+        self.assertEqual(seen, [30.0])
+        self.assertNotIn("error", out[0])
+
+    def test_a_huge_web_timeout_is_clamped_not_a_crash(self):
+        mod = load_plugin("deadline_web_huge", None)
+        saved = {name: sys.modules.get(name) for name in ("hermes_cli", "hermes_cli.config")}
+        pkg = types.ModuleType("hermes_cli")
+        pkg.__path__ = []  # type: ignore[attr-defined]
+        config_mod = types.ModuleType("hermes_cli.config")
+        config_mod.load_config_readonly = lambda: {"web": {"extract_timeout": 10**400}}
+        sys.modules["hermes_cli"] = pkg
+        sys.modules["hermes_cli.config"] = config_mod
+        try:
+            self.assertIsNone(mod._hermes_extract_timeout())
+            self.assertEqual(mod._extract_deadline(None), mod._EXTRACT_DEADLINE_S)
+            config_mod.load_config_readonly = lambda: {"web": {"extract_timeout": 30}}
+            self.assertEqual(mod._extract_deadline(None), 28.5)
+        finally:
+            for name, previous in saved.items():
+                if previous is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = previous
+
+
+class TestKeyHardening(MockVendor):
+    def test_a_raising_env_helper_is_graceful(self):
+        mod = load_plugin("key_raise", f"{self.base}/ok")
+
+        def boom(*_a, **_k):
+            raise RuntimeError("no active profile scope")
+
+        mod.get_provider_env = boom
+        p = mod.DeepSeekWebSearchProvider()
+        self.assertFalse(p.is_available())
+        out = p.search("q")
+        self.assertFalse(out["success"])
+        self.assertIn("DEEPSEEK_API_KEY", out["error"])
+        entries = p.extract(["https://example.invalid/x"])
+        self.assertEqual(len(entries), 1)
+        self.assertIn("DEEPSEEK_API_KEY", entries[0]["error"])
+
+    def test_helper_values_win_over_the_environment(self):
+        os.environ["DEEPSEEK_API_KEY"] = "env-key"
+        os.environ.pop("DEEPSEEK_SEARCH_NEED_CONTENT", None)
+        mod = load_plugin("key_helper", f"{self.base}/body_content")
+
+        def helper(name, default=""):
+            if name == "DEEPSEEK_API_KEY":
+                return "helper-key"
+            if name == "DEEPSEEK_SEARCH_NEED_CONTENT":
+                return "on"
+            return default
+
+        mod.get_provider_env = helper
+        out = mod.DeepSeekWebSearchProvider().search("q", limit=2)
+        self.assertTrue(out["success"], out)
+        self.assertEqual(Handler.requests[-1]["headers"].get("Authorization"), "Bearer helper-key")
+        self.assertEqual(self.last_body(), {"query": "q", "count": 2, "need_content": True})
+
+    def test_a_whitespace_padded_key_is_stripped(self):
+        p = provider("key_ws", f"{self.base}/body_content", api_key=f"  {DUMMY_KEY}  ")
+        p.search("q")
+        self.assertEqual(Handler.requests[-1]["headers"].get("Authorization"), f"Bearer {DUMMY_KEY}")
+
+
+class TestExtractInputHardening(MockVendor):
+    def test_a_bare_string_is_one_url(self):
+        p = provider("ex_str", f"{self.base}/ok")
+        out = p.extract("https://example.invalid/x")
+        self.assertEqual([entry["url"] for entry in out], ["https://example.invalid/x"])
+        self.assertEqual(self.last_body(), {"url": "https://example.invalid/x"})
+
+    def test_none_is_one_entry_not_a_raise(self):
+        p = provider("ex_none", f"{self.base}/ok")
+        out = p.extract(None)
+        self.assertEqual(len(out), 1)
+        self.assertIsNone(out[0]["url"])
+
+    def test_a_scalar_is_one_entry(self):
+        p = provider("ex_scalar", f"{self.base}/ok")
+        out = p.extract(42)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["url"], 42)
+
+    def test_a_tuple_and_unknown_kwargs_are_accepted(self):
+        p = provider("ex_tuple", f"{self.base}/ok")
+        urls = ("https://example.invalid/1", "https://example.invalid/2")
+        out = p.extract(urls, format="markdown", include_raw=True)
+        self.assertEqual([entry["url"] for entry in out], list(urls))
+
+    def test_fetch_posts_the_exact_requested_url(self):
+        p = provider("ex_exact", f"{self.base}/ok")
+        url = "https://example.invalid/p?q=1#frag"
+        out = p.extract([url])
+        self.assertEqual(self.last_body(), {"url": url})
+        self.assertEqual(out[0]["metadata"]["sourceURL"], url)
+
+    def test_an_error_first_does_not_abort_later_urls(self):
+        p = provider("ex_first", f"{self.base}/mixed")
+        out = p.extract(["https://example.invalid/boom", "https://example.invalid/ok"])
+        self.assertEqual(len(out), 2)
+        self.assertIn("error", out[0])
+        self.assertNotIn("error", out[1])
+        self.assertTrue(out[1]["content"])
+        self.assertEqual(out[1]["raw_content"], out[1]["content"])
+
+
+class TestResponseHardening(MockVendor):
+    def test_search_response_text_is_utf8_clean(self):
+        out = provider("resp_sur", f"{self.base}/body_surrogate").search("q")
+        self.assertTrue(out["success"], out)
+        hit = out["data"]["web"][0]
+        self.assertIn("\ufffd", hit["title"])
+        self.assertIn("\ufffd", hit["description"])
+        self.assertNotIn("\ud800", hit["title"])
+        json.dumps(out, ensure_ascii=False).encode("utf-8")
+
+    def test_extract_response_text_is_utf8_clean(self):
+        out = provider("resp_ex_sur", f"{self.base}/fetch_surrogate").extract(
+            ["https://example.invalid/x"])
+        self.assertIn("\ufffd", out[0]["title"])
+        self.assertIn("\ufffd", out[0]["raw_content"])
+        self.assertNotIn("\ud800", out[0]["raw_content"])
+        json.dumps(out, ensure_ascii=False).encode("utf-8")
+
+    def test_a_gzip_encoded_response_is_decoded_exactly_once(self):
+        """The live API sends Content-Encoding: gzip. The streaming path decodes
+        the chunks, so the reconstructed response must not advertise the
+        encoding again or httpx raises a zlib "incorrect header check"."""
+        out = provider("resp_gzip", f"{self.base}/gzip").search("q")
+        self.assertTrue(out["success"], out)
+        self.assertEqual(out["data"]["web"][0]["title"], "Gzipped")
+
+    def test_search_content_is_not_unescaped(self):
+        os.environ["DEEPSEEK_SEARCH_NEED_CONTENT"] = "1"
+        try:
+            out = provider("resp_esc", f"{self.base}/body_escaped").search("q")
+        finally:
+            os.environ.pop("DEEPSEEK_SEARCH_NEED_CONTENT", None)
+        self.assertEqual(out["data"]["web"][0]["content"], "\\d+ digits, C:\\path")
+
+    def test_missing_fields_map_to_empty_strings(self):
+        out = provider("resp_empty", f"{self.base}/shape_empty").search("q")
+        hit = out["data"]["web"][0]
+        self.assertEqual((hit["title"], hit["url"], hit["description"]), ("", "", ""))
+        for key in ("rerank_score", "authority", "date", "site_name", "site_icon"):
+            self.assertIsNone(hit[key])
+        self.assertEqual(hit["position"], 1)
+
+    def test_a_json_null_body_is_a_clear_error(self):
+        out = provider("resp_null", f"{self.base}/shape_nullbody").search("q")
+        self.assertFalse(out["success"])
+        self.assertIn("unexpected response shape", out["error"])
+
+
+class TestRegisterWiring(MockVendor):
+    class Ctx:
+        def __init__(self):
+            self.settings = {"need_content": False}
+            self.reads = []
+            self.provider = None
+
+        def get_config(self, key, default=None):
+            self.reads.append((key, default))
+            return self.settings.get(key, default)
+
+        def register_web_search_provider(self, provider):
+            self.provider = provider
+
+    def test_register_hands_the_provider_a_per_call_reader(self):
+        mod = load_plugin("reg_ok", f"{self.base}/body_content")
+        ctx = self.Ctx()
+        mod.register(ctx)
+        self.assertEqual(ctx.provider.name, "deepseek")
+        ctx.provider.search("first", limit=2)
+        self.assertNotIn("need_content", self.last_body())
+        ctx.settings["need_content"] = True
+        ctx.provider.search("second", limit=2)
+        self.assertEqual(self.last_body(), {"query": "second", "count": 2, "need_content": True})
+        self.assertTrue(any(key == "need_content" and default is None for key, default in ctx.reads))
+
+    def test_register_without_get_config_falls_back_to_the_environment(self):
+        os.environ["DEEPSEEK_SEARCH_NEED_CONTENT"] = "1"
+        try:
+            mod = load_plugin("reg_none", f"{self.base}/body_content")
+
+            class Ctx:
+                def __init__(self):
+                    self.provider = None
+
+                def register_web_search_provider(self, provider):
+                    self.provider = provider
+
+            ctx = Ctx()
+            mod.register(ctx)
+            ctx.provider.search("q")
+            self.assertEqual(self.last_body(), {"query": "q", "count": 5, "need_content": True})
+        finally:
+            os.environ.pop("DEEPSEEK_SEARCH_NEED_CONTENT", None)
+
+    def test_register_ignores_a_non_callable_get_config(self):
+        mod = load_plugin("reg_bad", f"{self.base}/body_content")
+
+        class Ctx:
+            get_config = "not callable"
+
+            def __init__(self):
+                self.provider = None
+
+            def register_web_search_provider(self, provider):
+                self.provider = provider
+
+        ctx = Ctx()
+        mod.register(ctx)
+        self.assertIsNotNone(ctx.provider)
+
+    def test_identity_and_setup_schema(self):
+        p = provider("reg_schema", f"{self.base}/ok")
+        schema = p.get_setup_schema()
+        self.assertEqual(set(schema), {"name", "badge", "tag", "env_vars"})
+        self.assertEqual(schema["name"], "DeepSeek")
+        self.assertEqual(schema["env_vars"][0]["key"], "DEEPSEEK_API_KEY")
+        self.assertEqual(p.name, "deepseek")
+        self.assertEqual(p.display_name, "DeepSeek")
+        self.assertTrue(p.supports_search())
+        self.assertTrue(p.supports_extract())
+
+
+class TestRetryAndLimits(unittest.TestCase):
+    def test_retry_after_parsing_table(self):
+        mod = load_plugin("lim_ra", None)
+        cases = {
+            None: None,
+            "": None,
+            "0": None,
+            "-5": None,
+            "nan": None,
+            "inf": None,
+            "1e309": None,
+            "Wed, 21 Oct 2015 07:28:00 GMT": None,
+            " 9 ": 9.0,
+            "0.5": 0.5,
+            "1e308": 1e308,
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(mod._retry_after_seconds(raw), expected)
+
+    def test_retryable_status_table(self):
+        mod = load_plugin("lim_status", None)
+        for code in (408, 429, 500, 501, 502, 503, 504, 599):
+            with self.subTest(code=code):
+                self.assertTrue(mod._is_retryable(code))
+        for code in (400, 401, 402, 403, 404, 409, 418, 600):
+            with self.subTest(code=code):
+                self.assertFalse(mod._is_retryable(code))
+
+    def test_documented_constants_are_pinned(self):
+        mod = load_plugin("lim_const", None)
+        self.assertEqual(mod._TIMEOUT, 30.0)
+        self.assertEqual(mod._RETRY_BUDGET_S, 40.0)
+        self.assertEqual(mod._EXTRACT_DEADLINE_S, 110.0)
+        self.assertEqual(mod._EXTRACT_DEADLINE_MIN_S, 5.0)
+        self.assertEqual(mod._EXTRACT_DEADLINE_MAX_S, 115.0)
+        self.assertEqual(mod._REQUEST_FLOOR_S, 0.5)
+        self.assertEqual(mod._RETRY_BACKOFF_S, (1.0, 2.0))
+        self.assertEqual(mod._RETRY_JITTER_S, 0.25)
+
+    def test_search_uses_the_full_timeout(self):
+        mod = load_plugin("lim_search_timeout", "http://127.0.0.1:9")
+        seen = []
+
+        def request(url, payload, headers, timeout=None, deadline=None):
+            seen.append((timeout, deadline))
+            return mod.httpx.Response(200, json={"results": []})
+
+        mod._request = request
+        mod.DeepSeekWebSearchProvider().search("q")
+        self.assertEqual(seen[0][0], 30.0)
+        self.assertIsNotNone(seen[0][1])
+
+    def test_extract_timeout_is_capped_at_30_and_floored_at_0_5(self):
+        mod = load_plugin("lim_extract_timeout", "http://127.0.0.1:9")
+        mod._hermes_extract_timeout = lambda: None
+        mod.__dict__.update(_EXTRACT_DEADLINE_S=5.0)  # dynamic module; untyped on purpose
+        clock = fast_clock(mod)
+        seen = []
+
+        def request(url, payload, headers, timeout=None, deadline=None):
+            seen.append(timeout)
+            clock["now"] += 4.8
+            return mod.httpx.Response(200, json={"title": "t", "content": "c"})
+
+        mod._request = request
+        mod.DeepSeekWebSearchProvider().extract(
+            ["https://example.invalid/1", "https://example.invalid/2", "https://example.invalid/3"])
+        self.assertEqual(seen, [5.0, 0.5])
+
+
+class TestExtractDetails(MockVendor):
+    def test_success_entry_has_exactly_the_documented_keys(self):
+        out = provider("det_ok", f"{self.base}/ok").extract(["https://example.invalid/x"])
+        self.assertEqual(set(out[0]), {"url", "title", "content", "raw_content", "metadata"})
+        self.assertEqual(out[0]["metadata"],
+                         {"sourceURL": "https://example.invalid/x", "title": "Mock Page"})
+        self.assertEqual(out[0]["raw_content"], out[0]["content"])
+
+    def test_error_entry_has_exactly_the_documented_keys(self):
+        mod = load_plugin("det_err", f"{self.base}/err")
+        fast_clock(mod)
+        out = mod.DeepSeekWebSearchProvider().extract(["https://example.invalid/x"])
+        self.assertEqual(set(out[0]), {"url", "title", "content", "error"})
+        self.assertEqual(out[0]["error"],
+                         "DeepSeek fetch failed: HTTP 500: boom (after 2 retries)")
+
+    def test_extract_deadline_is_reread_per_call(self):
+        mod = load_plugin("det_reread", f"{self.base}/ok")
+        reads = []
+
+        def reader(key):
+            reads.append(key)
+            return None
+
+        for _ in range(2):
+            mod.DeepSeekWebSearchProvider(reader).extract(["https://example.invalid/x"])
+        self.assertEqual(reads.count("extract_deadline"), 2)
+
+    def test_extract_survives_a_raising_settings_reader(self):
+        mod = load_plugin("det_raise", f"{self.base}/ok")
+
+        def boom(_key):
+            raise RuntimeError("config unavailable")
+
+        out = mod.DeepSeekWebSearchProvider(boom).extract(["https://example.invalid/x"])
+        self.assertNotIn("error", out[0])
+        self.assertTrue(out[0]["content"])
+
+    def test_extract_failure_log_does_not_leak_the_key(self):
+        mod = load_plugin("det_log", f"{self.base}/err")
+        fast_clock(mod)
+        with self.assertLogs(mod.__name__, level="WARNING") as captured:
+            mod.DeepSeekWebSearchProvider().extract(["https://example.invalid/x"])
+        self.assertNotIn(DUMMY_KEY, "\n".join(captured.output))
+
+    def test_extract_stops_before_a_retry_crosses_the_deadline(self):
+        mod = load_plugin("det_deadline", f"{self.base}/r429")
+        mod._hermes_extract_timeout = lambda: None
+        mod.__dict__.update(_EXTRACT_DEADLINE_S=3.0, _EXTRACT_DEADLINE_MIN_S=3.0)
+        clock = fast_clock(mod)
+        out = mod.DeepSeekWebSearchProvider().extract(["https://example.invalid/x"])
+        self.assertIn("HTTP 429", out[0]["error"])
+        self.assertIn("(after 1 retry)", out[0]["error"])
+        self.assertNotIn("batch deadline", out[0]["error"])
+        self.assertEqual(clock["sleeps"], [1.0])
+
+
+class TestLocalizationHardening(MockVendor):
+    def test_ipv6_is_sent(self):
+        mod = load_plugin("loc6", f"{self.base}/body_content")
+        p = mod.DeepSeekWebSearchProvider(
+            lambda key: "2001:db8::1" if key == "localization" else None)
+        p.search("q", limit=2)
+        self.assertEqual(self.last_body()["localization"], "2001:db8::1")
+
+    def test_padding_is_stripped(self):
+        mod = load_plugin("locpad", f"{self.base}/body_content")
+        p = mod.DeepSeekWebSearchProvider(
+            lambda key: " 203.0.113.7 " if key == "localization" else None)
+        p.search("q", limit=2)
+        self.assertEqual(self.last_body()["localization"], "203.0.113.7")
+
+    def test_junk_warns_and_is_not_sent(self):
+        mod = load_plugin("locwarn", f"{self.base}/body_content")
+        with self.assertLogs(mod.__name__, level="WARNING") as captured:
+            p = mod.DeepSeekWebSearchProvider(
+                lambda key: "not-an-ip" if key == "localization" else None)
+            p.search("q", limit=2)
+        self.assertIn("not an IP", "\n".join(captured.output))
+        self.assertNotIn("localization", self.last_body())
+
+
+class TestWallClock(MockVendor):
+    """The deadline must be wall-clock, not just httpx's per-read timer."""
+
+    def test_request_aborts_a_trickling_body(self):
+        mod = load_plugin("wc_request", f"{self.base}/trickle")
+        started = time.monotonic()
+        with self.assertRaises(mod.httpx.ReadTimeout):
+            mod._request(f"{self.base}/trickle", {}, {}, timeout=0.25,
+                         deadline=mod._monotonic() + 0.25)
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_search_aborts_a_trickling_body(self):
+        mod = load_plugin("wc_search", f"{self.base}/trickle")
+        mod.__dict__.update(_TIMEOUT=0.25)  # dynamic module; untyped on purpose
+        started = time.monotonic()
+        out = mod.DeepSeekWebSearchProvider().search("q")
+        self.assertFalse(out["success"], out)
+        self.assertIn("deadline", out["error"])
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_extract_aborts_a_trickling_body(self):
+        mod = load_plugin("wc_extract", f"{self.base}/trickle")
+        mod._hermes_extract_timeout = lambda: None
+        mod.__dict__.update(_EXTRACT_DEADLINE_S=0.25, _EXTRACT_DEADLINE_MIN_S=0.25)
+        started = time.monotonic()
+        out = mod.DeepSeekWebSearchProvider().extract(["https://example.invalid/x"])
+        self.assertIn("error", out[0])
+        self.assertLess(time.monotonic() - started, 2.5)
+
+
+class TestManifestFloor(unittest.TestCase):
+    def test_plugin_yaml_declares_requires_hermes(self):
+        manifest = Path(PLUGIN).with_name("plugin.yaml")
+        if not manifest.is_file():
+            self.skipTest("plugin.yaml is not next to this plugin copy")
+        text = manifest.read_text(encoding="utf-8")
+        self.assertIn('requires_hermes: ">=0.22.0"', text)
 
 
 if __name__ == "__main__":

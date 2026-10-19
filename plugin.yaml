@@ -1,6 +1,7 @@
 name: deepseek-search-fetch
-version: 1.0.7
-description: "DeepSeek Search & Fetch as a Hermes web backend: routes web_search and web_extract through api.deepseek.com/v1/tools/search and /v1/tools/fetch with your own key. Hits carry rerank_score, authority, date, site_name and site_icon so a result set can be filtered and attributed before anything is fetched, and fetched Markdown has the vendor's punctuation escaping reversed. A need_content setting returns each hit's page text as clean Markdown. Billed by DeepSeek at $0.75 per 1,000 successful requests (failed calls and empty results are free); 5 QPS per account, and fetch takes one URL per call. Community plugin, not affiliated with DeepSeek."
+version: 1.0.8
+requires_hermes: ">=0.22.0"
+description: "DeepSeek Search & Fetch as a Hermes web backend: routes web_search and web_extract through api.deepseek.com/v1/tools/search and /v1/tools/fetch with your own key. Hits carry rerank_score, authority, date, site_name and site_icon so a result set can be filtered and attributed before anything is fetched, and fetched Markdown has the vendor's punctuation escaping reversed. A need_content setting returns each hit's page text as clean Markdown. Billed by DeepSeek at $0.75 per 1,000 successful requests (failed calls and empty results are free); rate-limited per account (the guide lists 100 QPS for Search and 25 QPS for Fetch, and Fetch also has a per-domain cap), and fetch takes one URL per call. Community plugin, not affiliated with DeepSeek."
 author: Jason Swindle
 license: MIT
 homepage: https://github.com/JasonSwindle/hermes-deepseek-search-fetch
@@ -16,12 +17,12 @@ config_schema:
   need_content:
     type: bool
     default: false
-    description: "Send need_content so each search hit carries its page text as clean Markdown. Off by default: a live run returned 20 KB for one hit, so a result set can cost tens of KB of context. A query already in Hermes' 20-minute search cache keeps its cached shape until the cache expires."
+    description: "Send need_content so each search hit carries its page text as clean Markdown. Off by default: a live run returned 20 KB for one hit, so a result set can cost tens of KB of context. A query already in Hermes' search cache (20 minutes by default, web.cache_ttl_minutes) keeps its cached shape until the cache expires."
   localization:
     type: str
     default: ""
-    description: "Optional IP address the Search API localises results to. Empty sends nothing; a value that is not an IP is ignored with a warning rather than sent."
+    description: "Optional IP address the Search API localises results to. Empty sends nothing; a value that is not an IP is ignored with a warning rather than sent. A query already in Hermes' search cache keeps its old localization until the cache expires."
   extract_deadline:
     type: int
     default: 110
-    description: "Seconds one multi-URL web_extract may spend starting requests, clamped to 5-115. Must stay below web.extract_timeout (120 by default); lower it if you lowered that."
+    description: "Upper bound on the seconds one multi-URL web_extract may spend starting requests, clamped to 5-115. The effective deadline is also clamped to web.extract_timeout minus 1.5s when that public setting is readable, so a lowered Hermes timeout is respected automatically."
