@@ -5,6 +5,7 @@
 [![tests](https://github.com/JasonSwindle/hermes-deepseek-search-fetch/actions/workflows/tests.yml/badge.svg)](https://github.com/JasonSwindle/hermes-deepseek-search-fetch/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes Agent plugin](https://img.shields.io/badge/Hermes-Agent%20plugin-8A63D2.svg)](https://github.com/NousResearch/hermes-agent)
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
 Wires DeepSeek's [Search & Fetch APIs](https://api-docs.deepseek.com/guides/search/) into [Hermes Agent](https://hermes-agent.nousresearch.com/docs)'s `web_search` and `web_extract`. One file, no dependencies, and the invariants that would otherwise fail silently are pinned by the tests in `tests/`.
 
@@ -233,5 +234,3 @@ hermes-agent, hermes-plugin, deepseek, deepseek-api, web-search, web-extract, se
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
