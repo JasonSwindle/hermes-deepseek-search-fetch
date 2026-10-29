@@ -51,7 +51,19 @@ The live acceptance does not normally provoke 429s. A one-off manual probe on 20
 30-request same-domain Fetch burst produced three 429s (`Your current QPS: 25`, no `Retry-After`),
 and 40 concurrent `extract()` calls produced 13 real 429s — all 40 recovered on the first 1s+jitter
 retry. That is recorded evidence for the docs, not a CI test; do not wire load generation into the
-suite or run it routinely.
+suite or run it routinely. The documented QPS was 5/5 on 2026-10-18 and 100/25 by 2026-10-24; the
+2026-10-19 Fetch 429 matched 25. Do not describe the old 5 as account variance — it predates the raise.
+
+Vendor assumptions that no mock can pin:
+- The vendor **ignores unknown request-body fields**, so a silent field rename would return 200 with
+  default behaviour rather than an error. Only the live acceptance can catch that; keep its
+  assertions on actual values (signals, content, escaping), not just `success`.
+- Fetch content's backslash escaping is **undocumented** and unversioned. `dsweb-live-accept.py`
+  captures the raw body and asserts the escape before the plugin reverses it; that raw-wire check is
+  the tripwire. Do not replace the unescaper with a heuristic — a wrong heuristic corrupts valid
+  Markdown, while the live check tells us when the vendor changes.
+- Search content being clean Markdown and `Content-Encoding: gzip` are likewise live observations,
+  not documented promises.
 
 Falsification check (do this when you touch the sanitizer, unescaper, guard, key path, deadline, or
 response mapping): make a copy of the plugin with the relevant guard neutered — `_utf8_safe` to
