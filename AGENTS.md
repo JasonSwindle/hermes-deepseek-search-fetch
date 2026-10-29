@@ -132,9 +132,10 @@ that stays green against a broken copy proves nothing.
   the attempt deadline; `_post` passes `min(now + attempt_timeout, batch_deadline)`. An `extract()`
   attempt is additionally given only the batch time left, and `_extract_deadline` clamps the setting
   (default 110, max 115) to `web.extract_timeout − 1.5 s` when the public `hermes_cli.config` read
-  works. Worst case is the effective deadline plus `_REQUEST_FLOOR_S`;
-  `_EXTRACT_DEADLINE_MAX_S + _REQUEST_FLOOR_S <= 120` is pinned by a test. A trickle-body regression
-  test would fail against the old blocking `httpx.post`.
+  works. That read mirrors Hermes' own `float()` coercion: numeric strings count, a 3 s Hermes
+  timeout wins over the 5 s setting floor, and 0/negative means no cap. Worst case is the effective
+  deadline plus `_REQUEST_FLOOR_S`; `_EXTRACT_DEADLINE_MAX_S + _REQUEST_FLOOR_S <= 120` is pinned by
+  a test. A trickle-body regression test would fail against the old blocking `httpx.post`.
 
 ## Do not
 
@@ -187,7 +188,7 @@ cut when something must be pinned — a plugin code change, or a catalog re-pin.
 README tweak is churn the catalog does not need, and each one is another number the entry
 has to explain. **Catalog card images are pinned to the entry's SHA**, so a changed
 `docs/banner.png`/`logo.png` does need a new SHA and re-pin (that is why 1.0.4/1.0.5 existed);
-an unchanged image URL can keep the current SHA when only text changes. The 1.0.8 re-pin must
+an unchanged image URL can keep the current SHA when only text changes. Each re-pin must
 also update the catalog entry's `version`, `sha`, and the `image:` URL's SHA, and keep its
 `requires_hermes: ">=0.22.0"` in step with `plugin.yaml`.
 

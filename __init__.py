@@ -119,6 +119,8 @@ _EXTRACT_DEADLINE_MAX_S = 115.0
 # Effective batch deadline = min(setting, web.extract_timeout - this margin), so
 # one in-flight attempt plus the floor still fits Hermes' cap.
 _EXTRACT_TIMEOUT_MARGIN_S = 1.5
+# Hermes' own default when web.extract_timeout is absent or unparseable.
+_HERMES_DEFAULT_EXTRACT_TIMEOUT_S = 120.0
 # A hostile or broken response cannot make one call allocate without bound.
 _BODY_LIMIT_BYTES = 16 * 1024 * 1024
 _READ_FLOOR_S = 0.1
@@ -224,27 +226,29 @@ def _localization(get_setting=None) -> str:
 def _hermes_extract_timeout() -> float | None:
     """Hermes' ``web.extract_timeout`` when it can be read, else ``None``.
 
-    ``hermes_cli.config`` is a documented public module, so this does not widen
-    the plugin's private-import surface. Any failure — an older Hermes, a
-    missing function, a broken config — is simply "not readable", and the
-    extract_deadline setting/default stands alone.
+    Mirrors Hermes' own ``_extract_timeout_seconds`` coercion: ``float(value)``
+    accepts numeric strings (a quoted/env-expanded config value), booleans and
+    numbers; a missing or unusable value falls back to Hermes' 120 s default,
+    and 0/negative means Hermes runs without a cap (``None`` here). Reading a
+    broken config, or an older Hermes without the public helper, is simply "not
+    readable" and leaves the extract_deadline setting/default in charge.
     """
     try:
         from hermes_cli.config import load_config_readonly
 
         web = (load_config_readonly() or {}).get("web") or {}
-        value = web.get("extract_timeout")
+        value = web.get("extract_timeout", _HERMES_DEFAULT_EXTRACT_TIMEOUT_S)
     except Exception:  # never raise out of a capability
-        return None
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
         return None
     try:
         number = float(value)
-    except (OverflowError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return _HERMES_DEFAULT_EXTRACT_TIMEOUT_S
+    if not math.isfinite(number):
+        return _HERMES_DEFAULT_EXTRACT_TIMEOUT_S
+    if number <= 0:
         return None
-    if math.isfinite(number) and number > 0:
-        return number
-    return None
+    return number
 
 
 def _extract_deadline(get_setting=None) -> float:
@@ -252,15 +256,24 @@ def _extract_deadline(get_setting=None) -> float:
 
     The setting/default is clamped to 5-115, then clamped again below Hermes'
     ``web.extract_timeout`` (minus a margin) when that public setting is
-    readable. Anything unusable — NaN, infinity, an overflowing integer, a
-    failed settings read — falls back to the built-in value, so a bad setting
-    can never uncap the batch or raise out of ``extract()``.
+    readable. The web cap wins even when it is below the setting's 5 s floor:
+    Hermes abandons the whole batch at its own timeout, so a 3 s web timeout
+    yields a 1.5 s deadline, not 5. Anything unusable — NaN, infinity, an
+    overflowing integer, a failed settings read — falls back to the built-in
+    value, so a bad setting can never uncap the batch or raise out of
+    ``extract()``. Numeric strings are accepted for the plugin's own setting,
+    since config values can arrive quoted or environment-expanded.
     """
     value: Any = None
     if get_setting is not None:
         try:
             value = get_setting(_EXTRACT_DEADLINE_SETTING)
         except Exception:  # never raise out of a capability
+            value = None
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
             value = None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         try:
@@ -276,7 +289,7 @@ def _extract_deadline(get_setting=None) -> float:
     deadline = min(max(deadline, _EXTRACT_DEADLINE_MIN_S), _EXTRACT_DEADLINE_MAX_S)
     web_timeout = _hermes_extract_timeout()
     if web_timeout is not None:
-        deadline = min(deadline, max(_EXTRACT_DEADLINE_MIN_S, web_timeout - _EXTRACT_TIMEOUT_MARGIN_S))
+        deadline = min(deadline, max(_READ_FLOOR_S, web_timeout - _EXTRACT_TIMEOUT_MARGIN_S))
     return deadline
 
 

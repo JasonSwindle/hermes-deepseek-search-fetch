@@ -1096,6 +1096,51 @@ class TestDeadlineHardening(unittest.TestCase):
         self.assertEqual(mod._extract_deadline(None), 28.5)
         mod._hermes_extract_timeout = lambda: 120.0
         self.assertEqual(mod._extract_deadline(None), 110.0)
+        # Hermes' cap wins even below the setting's 5s floor: Hermes abandons
+        # the batch at its own timeout, so 3s must not become a 5s deadline.
+        mod._hermes_extract_timeout = lambda: 3.0
+        self.assertEqual(mod._extract_deadline(None), 1.5)
+
+    def test_extract_deadline_accepts_a_numeric_string_setting(self):
+        mod = self._mod("deadline_setting_str")
+        self.assertEqual(mod._extract_deadline(lambda _k: "90"), 90.0)
+        self.assertEqual(mod._extract_deadline(lambda _k: " 42 "), 42.0)
+        self.assertEqual(mod._extract_deadline(lambda _k: "3"), mod._EXTRACT_DEADLINE_MIN_S)
+        self.assertEqual(mod._extract_deadline(lambda _k: "soon"), mod._EXTRACT_DEADLINE_S)
+
+    def test_hermes_web_timeout_coercion_matches_hermes(self):
+        """Hermes uses float(value); mirror numeric strings, bools, 0/negative."""
+        mod = load_plugin("deadline_web_coerce", None)
+        saved = {name: sys.modules.get(name) for name in ("hermes_cli", "hermes_cli.config")}
+        pkg = types.ModuleType("hermes_cli")
+        pkg.__path__ = []  # type: ignore[attr-defined]
+        config_mod = types.ModuleType("hermes_cli.config")
+        holder = {"value": 120}
+        config_mod.load_config_readonly = lambda: {"web": {"extract_timeout": holder["value"]}}
+        sys.modules["hermes_cli"] = pkg
+        sys.modules["hermes_cli.config"] = config_mod
+        try:
+            cases = [
+                ("30", 30.0, 28.5),   # quoted/env-expanded config value
+                (3, 3.0, 1.5),        # below the setting's 5s floor
+                (0, None, 110.0),     # 0 disables Hermes' cap
+                (-1, None, 110.0),
+                (True, 1.0, 0.1),
+                (None, 120.0, 110.0),
+                ("abc", 120.0, 110.0),
+                (10**400, 120.0, 110.0),
+            ]
+            for value, expected_timeout, expected_deadline in cases:
+                with self.subTest(value=value):
+                    holder["value"] = value
+                    self.assertEqual(mod._hermes_extract_timeout(), expected_timeout)
+                    self.assertEqual(mod._extract_deadline(None), expected_deadline)
+        finally:
+            for name, previous in saved.items():
+                if previous is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = previous
 
     def test_a_nan_setting_still_uses_the_full_timeout(self):
         mod = self._mod("deadline_nan_timeout")
@@ -1110,27 +1155,6 @@ class TestDeadlineHardening(unittest.TestCase):
         out = p.extract(["https://example.invalid/x"])
         self.assertEqual(seen, [30.0])
         self.assertNotIn("error", out[0])
-
-    def test_a_huge_web_timeout_is_clamped_not_a_crash(self):
-        mod = load_plugin("deadline_web_huge", None)
-        saved = {name: sys.modules.get(name) for name in ("hermes_cli", "hermes_cli.config")}
-        pkg = types.ModuleType("hermes_cli")
-        pkg.__path__ = []  # type: ignore[attr-defined]
-        config_mod = types.ModuleType("hermes_cli.config")
-        config_mod.load_config_readonly = lambda: {"web": {"extract_timeout": 10**400}}
-        sys.modules["hermes_cli"] = pkg
-        sys.modules["hermes_cli.config"] = config_mod
-        try:
-            self.assertIsNone(mod._hermes_extract_timeout())
-            self.assertEqual(mod._extract_deadline(None), mod._EXTRACT_DEADLINE_S)
-            config_mod.load_config_readonly = lambda: {"web": {"extract_timeout": 30}}
-            self.assertEqual(mod._extract_deadline(None), 28.5)
-        finally:
-            for name, previous in saved.items():
-                if previous is None:
-                    sys.modules.pop(name, None)
-                else:
-                    sys.modules[name] = previous
 
 
 class TestKeyHardening(MockVendor):

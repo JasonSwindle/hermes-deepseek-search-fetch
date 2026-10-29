@@ -101,7 +101,7 @@ That removes the DeepSeek pins and returns those keys to Hermes' default/autodet
 
 **429s, observed live (2026-10-19).** A 30-request same-domain Fetch burst produced three 429s whose body said `Your current QPS: 25` — matching the guide — with no `Retry-After` header. The 2026-10-18 QPS-5 observation predates the documented 5→25/100 raise, so it is not evidence of a lower account ceiling. In a separate 40-request concurrent `extract()` burst, 13 calls hit a real 429 and **all 40 recovered on the first 1s+jitter retry** (observed sleeps 1.03–1.21s). These probes were run by hand against a real key, never in CI.
 
-A multi-URL extract stops starting requests at the **effective deadline** (the `extract_deadline` setting, 110 s by default, clamped to 5–115, and additionally clamped to `web.extract_timeout − 1.5 s` when that public setting is readable). The request itself is **streamed and checked against a wall clock**, because `httpx` timeouts are per connect/read: a body that trickles in can outlive a nominal 30 s timeout. Each attempt gets only the time the deadline has left, and an in-flight body is aborted at that deadline, so worst case is the effective deadline plus the 0.5 s floor — inside Hermes' **120 s** default, so pages already fetched are returned instead of the batch being discarded. Lower `extract_deadline` if you want a shorter upper bound; the web-timeout clamp is automatic when Hermes' public config is readable.
+A multi-URL extract stops starting requests at the **effective deadline** (the `extract_deadline` setting, 110 s by default, clamped to 5–115, and additionally clamped to `web.extract_timeout − 1.5 s` when that public setting is readable — numeric strings and values below 5 s included, matching Hermes' own `float()` coercion; 0 or negative means Hermes has no cap). The request itself is **streamed and checked against a wall clock**, because `httpx` timeouts are per connect/read: a body that trickles in can outlive a nominal 30 s timeout. Each attempt gets only the time the deadline has left, and an in-flight body is aborted at that deadline, so worst case is the effective deadline plus the 0.5 s floor — inside Hermes' **120 s** default, so pages already fetched are returned instead of the batch being discarded. Lower `extract_deadline` if you want a shorter upper bound; the web-timeout clamp is automatic when Hermes' public config is readable.
 
 **Behaviour worth knowing.**
 
@@ -179,10 +179,10 @@ Offline, keyless and unbilled: a loopback mock server stands in for the vendor, 
 
 ```bash
 # stdlib-unittest tier (no Hypothesis; needs httpx, which Hermes ships) —
-# 113 tests (112 + a skip placeholder)
+# 114 tests (113 + a skip placeholder)
 python -m unittest discover -s tests
 
-# Full tier, adding the Hypothesis property tests — 123 tests
+# Full tier, adding the Hypothesis property tests — 124 tests
 uv venv .venv-dev
 uv pip install --python .venv-dev/bin/python -r requirements-dev.txt
 .venv-dev/bin/python -m unittest discover -s tests
