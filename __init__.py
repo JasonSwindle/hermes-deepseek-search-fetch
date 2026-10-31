@@ -13,6 +13,11 @@ internal to the shipped tree; a user plugin imports only agent.web_search_provid
 and httpx (both guaranteed present — every sibling provider uses httpx). The one
 exception is a guarded, lazy read of Hermes' public hermes_cli.config for
 web.extract_timeout, so this plugin can keep its batch inside Hermes' cap.
+
+The vendor caps a Search query at 128 characters, so the query is clamped
+client-side (at a word boundary where one is close enough) before it is sent:
+a too-long query is never sent as-is, so it cannot earn the vendor's HTTP 400
+and be silently re-served by the keyless ring instead.
 """
 from __future__ import annotations
 
@@ -77,6 +82,8 @@ _SEARCH_URL = f"{_BASE}/v1/tools/search"
 _FETCH_URL = f"{_BASE}/v1/tools/fetch"
 _TIMEOUT = 30.0
 _SEARCH_LIMIT_CAP = 50  # DeepSeek count: 1-50
+_SEARCH_QUERY_MAX = 128  # vendor: query 1-128 characters
+_QUERY_CUT_FLOOR = 96  # don't chase a word boundary into a stub
 
 # Search & Fetch are read-only, and the vendor's rule for them is specific:
 # wait and retry HTTP 408, 429 and 5xx; top up on 402; send every other 4xx
@@ -137,6 +144,17 @@ _SURROGATE_RE = re.compile("[\ud800-\udfff]")
 def _utf8_safe(text: str) -> str:
     """Return *text* with unpaired surrogates replaced by U+FFFD."""
     return _SURROGATE_RE.sub("\ufffd", text)
+
+
+def _clamp_query(text: str) -> str:
+    """Clamp to the vendor's 128-character query limit, preferring a word boundary."""
+    if len(text) <= _SEARCH_QUERY_MAX:
+        return text
+    head = text[:_SEARCH_QUERY_MAX]
+    cut = head.rfind(" ")
+    if cut >= _QUERY_CUT_FLOOR:
+        head = head[:cut]
+    return head.rstrip()
 
 
 # The fetch endpoint escapes every ASCII punctuation character in the page text:
@@ -584,6 +602,14 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
             return {"success": False, "error": _missing_key_error()}
         try:
             query = _utf8_safe(query) if isinstance(query, str) else query
+            if isinstance(query, str):
+                clamped = _clamp_query(query)
+                if clamped != query:
+                    logger.warning(
+                        "DeepSeek query clamped %d to %d chars (vendor limit %d)",
+                        len(query), len(clamped), _SEARCH_QUERY_MAX,
+                    )
+                query = clamped
             count = min(max(int(limit), 1), _SEARCH_LIMIT_CAP)
             want_content = _need_content_enabled(self._get_setting)
             payload: dict[str, Any] = {"query": query, "count": count}

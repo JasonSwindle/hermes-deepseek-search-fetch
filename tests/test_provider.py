@@ -554,6 +554,47 @@ class TestSearchContract(MockVendor):
         p.search("lone \ud800 query")
         self.assertEqual(self.last_body()["query"], "lone \ufffd query")
 
+    def test_query_at_vendor_cap_is_sent_unchanged(self):
+        """128 characters is the vendor's documented maximum, not over it."""
+        query = "a " * 63 + "ab"
+        self.assertEqual(len(query), 128)
+        provider("s_q128", f"{self.base}/ok").search(query)
+        self.assertEqual(self.last_body()["query"], query)
+
+    def test_query_over_cap_is_clamped_to_a_word_boundary(self):
+        query = "word " * 60
+        self.assertEqual(len(query), 300)
+        provider("s_q300", f"{self.base}/ok").search(query)
+        sent = self.last_body()["query"]
+        self.assertLessEqual(len(sent), 128)
+        self.assertTrue(query.startswith(sent), sent)
+        self.assertTrue(sent.endswith("word"), sent)
+        self.assertNotEqual(sent, query[:128], "a boundary cut must be preferred over a hard cut")
+
+    def test_query_clamp_logs_one_warning(self):
+        query = "word " * 60
+        mod = load_plugin("s_qlog", f"{self.base}/ok")
+        with self.assertLogs(mod.__name__, level="WARNING") as captured:
+            mod.DeepSeekWebSearchProvider().search(query)
+        self.assertEqual(len(captured.records), 1)
+        message = captured.records[0].getMessage()
+        self.assertIn("300", message)
+        self.assertIn("128", message)
+
+    def test_query_without_spaces_hard_cuts(self):
+        query = "a" * 200
+        provider("s_qhard", f"{self.base}/ok").search(query)
+        sent = self.last_body()["query"]
+        self.assertEqual(len(sent), 128)
+        self.assertTrue(query.startswith(sent))
+
+    def test_clamp_counts_characters_not_bytes(self):
+        query = "\u00e9" * 200  # 200 characters, 400 UTF-8 bytes
+        provider("s_qbytes", f"{self.base}/ok").search(query)
+        sent = self.last_body()["query"]
+        self.assertEqual(len(sent), 128)
+        self.assertGreater(len(sent.encode("utf-8")), 128)
+
     def test_empty_results_is_success(self):
         p = provider("s_null", f"{self.base}/shape_null")
         out = p.search("q")
