@@ -19,7 +19,9 @@ What it proves, and what it cannot:
   * `localization` is accepted by the endpoint rather than rejected as an unknown field;
   * fetch returns escaped Markdown at the wire and our unescaper turns it back into structure
     (issue #1) — the raw body is captured before `extract()` rewrites it;
-  * a 129-character query is rejected with HTTP 400 and costs nothing.
+  * a query over 128 characters is clamped client-side and accepted (one billable call;
+    the vendor's own 400 is no longer reachable through the plugin, and the 128-character
+    cap itself stays pinned by the unit tests).
 It does not prove retry behaviour (that would mean provoking 429s on a real account) or anything
 about a Hermes session — `dsweb-integration.py` covers the dispatcher with a mock.
 """
@@ -39,7 +41,7 @@ sys.path.insert(0, str(REPO))
 # A Markdown-heavy page, the same repro as issue #1: its raw content carries
 # hundreds of punctuation escapes, so the unescaper is actually exercised.
 FETCH_URL = "https://en.wikipedia.org/wiki/Markdown"
-EXPECTED_CHECKS = 13
+EXPECTED_CHECKS = 12
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -172,12 +174,15 @@ def main() -> int:
         check("fetched Markdown keeps a heading",
               "# " in content or "\n# " in content, repr(content[:200]))
 
-        # 5. The documented 128-character cap: rejected, and free.
+        # 5. The documented 128-character cap is enforced client-side since 1.0.10:
+        #    a >128-character query is clamped before it is sent, so it must be
+        #    accepted rather than rejected. The vendor's own 400 is therefore not
+        #    reachable through the plugin; the unit tier pins the 128-character cap
+        #    (and the clamp), this check only proves the long query still works live.
         out = provider().search("x" * 129, limit=1)
-        check("a 129-character query is rejected", out.get("success") is False, str(out)[:200])
-        check("the rejection names HTTP 400",
-              out.get("success") is False and "400" in str(out.get("error", "")),
-              str(out.get("error"))[:200])
+        check("a 129-character query is clamped and accepted",
+              out.get("success") is True and "400" not in str(out.get("error", "")),
+              str(out)[:300])
     finally:
         plugin._request = real_request
 

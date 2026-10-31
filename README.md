@@ -211,8 +211,8 @@ your checkout lives elsewhere. Without `--install` the harness tests whatever is
 that `HERMES_HOME` and prints a warning.
 
 Neither of those touches the vendor, so neither can show that DeepSeek accepts what we send.
-`dsweb-live-accept.py` is the one run that can, and it **spends money** — about $0.003–0.004 for its
-four billable calls (the 129-character 400 is free). Run it once before a release, never in CI:
+`dsweb-live-accept.py` is the one run that can, and it **spends money** — about $0.004 for its
+five billable calls. Run it once before a release, never in CI:
 
 ```bash
 python dsweb-live-accept.py --spend
@@ -221,9 +221,11 @@ python dsweb-live-accept.py --spend
 It proves a live search returns hits with the vendor's signals, that `need_content` really returns
 page text and that search content is clean Markdown at the wire, that `localization` is accepted
 rather than rejected as an unknown field, that the fetch endpoint's **raw** body is backslash-escaped
-and the plugin turns it back into headings/links, and that a 129-character query is refused with HTTP
-400. The raw-response capture is what makes the unescape check falsifiable; asserting after the
-transform would pass on a no-op.
+and the plugin turns it back into headings/links, and that a query over 128 characters is clamped
+client-side and accepted rather than sent as-is (the vendor's own HTTP 400 is therefore no longer
+reachable through the plugin; the 128-character cap itself is pinned by the unit tier). The
+raw-response capture is what makes the unescape check falsifiable; asserting after the transform
+would pass on a no-op.
 
 The property tier generates arbitrary Unicode — including unpaired surrogates, which Hypothesis' default `st.text()` alphabet deliberately excludes — and asserts the invariant that made it necessary: whatever a caller passes, a UTF-8-encodable value reaches the wire. Point `DEEPSEEK_PLUGIN_PATH` at another copy of the plugin to test that copy; the falsification procedure and the invariants that must not break live in [AGENTS.md](AGENTS.md).
 
