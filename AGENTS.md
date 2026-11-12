@@ -106,7 +106,9 @@ that stays green against a broken copy proves nothing.
   `localization` is sent only when `ipaddress.ip_address` accepts it — the API takes an IP, so
   anything else would be a billed 400. The manifest declares `requires_hermes: ">=0.22.0"` (the
   settings surface's floor, matching the catalog entry); direct imports and the validation probe
-  still tolerate a missing reader.
+  still tolerate a missing reader. It also declares `config_keys: [web.extract_timeout]` — the one
+  core config path the plugin reads — so `hermes config get/set` accepts that key while the plugin
+  is active (0.23+; older hosts ignore the field).
 - `hermes plugins validate .` on a working tree that carries `.venv-dev/` fails its security scan on
   the virtualenv (`.so` files, symlinks, trio's sockets). That is the dev tree, not the plugin:
   validate a clean export (`git archive HEAD | tar -x -C <dir>`) or the catalog install path. The
@@ -156,8 +158,8 @@ that stays green against a broken copy proves nothing.
 ## Layout and naming
 
 - `__init__.py` — the entire plugin. `plugin.yaml` — manifest (`kind: backend`,
-  `provides_web_providers: [deepseek]`, `requires_hermes: ">=0.22.0"`; the catalog entry
-  carries the same floor).
+  `provides_web_providers: [deepseek]`, `requires_hermes: ">=0.22.0"`,
+  `config_keys: [web.extract_timeout]`; the catalog entry carries the same floor).
 - `docs/` — brand assets only (`logo.png` 512×512, `banner.png` 1200×600 for the catalog card's
   2:1 `image` field, `social-preview.png` 1280×640 for GitHub's link-unfurl card). `logo.png` and
   `banner.png` carry **transparency outside the badge** on purpose: one file then reads correctly on

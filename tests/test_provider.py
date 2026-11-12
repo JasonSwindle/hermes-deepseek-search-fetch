@@ -1585,13 +1585,23 @@ class TestWallClock(MockVendor):
         self.assertLess(time.monotonic() - started, 2.5)
 
 
-class TestManifestFloor(unittest.TestCase):
+class TestManifestDeclarations(unittest.TestCase):
     def test_plugin_yaml_declares_requires_hermes(self):
         manifest = Path(PLUGIN).with_name("plugin.yaml")
         if not manifest.is_file():
             self.skipTest("plugin.yaml is not next to this plugin copy")
         text = manifest.read_text(encoding="utf-8")
         self.assertIn('requires_hermes: ">=0.22.0"', text)
+
+    def test_plugin_yaml_declares_web_extract_timeout(self):
+        """The plugin reads web.extract_timeout; config_keys is what makes Hermes'
+        config get/set recognize that core key while the plugin is active."""
+        manifest = Path(PLUGIN).with_name("plugin.yaml")
+        if not manifest.is_file():
+            self.skipTest("plugin.yaml is not next to this plugin copy")
+        text = manifest.read_text(encoding="utf-8")
+        self.assertIn("config_keys:", text)
+        self.assertIn("- web.extract_timeout", text)
 
 
 if __name__ == "__main__":
